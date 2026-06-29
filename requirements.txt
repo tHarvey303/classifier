@@ -1,0 +1,9 @@
+boto3
+psycopg2-binary
+Flask-Login
+Flask
+Flask-SQLAlchemy
+pyyaml
+gunicorn
+python-dotenv
+astropy

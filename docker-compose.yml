@@ -1,0 +1,41 @@
+services:
+  web:
+    build: .
+    # ports:
+    #   - "5000:5000" # Disable direct access, let Traefik handle routing
+    # Loads environment variables from the .env file
+    env_file:
+      - .env
+    depends_on:
+      - db
+    restart: always
+    networks:
+      - default        # Internal network for DB access
+      - traefik_network # External network for Traefik access
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.classifier.rule=Host(`classifier.tharvey.space`)"
+      - "traefik.http.routers.classifier.entrypoints=websecure"
+      - "traefik.http.routers.classifier.tls=true"
+      # Replace 'myresolver' with your actual cert resolver name from traefik.toml/yaml
+      - "traefik.http.routers.classifier.tls.certresolver=letsencrypt"
+      - "traefik.http.services.classifier.loadbalancer.server.port=5000"
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=classifier
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+    networks:
+      - default
+
+volumes:
+  postgres_data:
+
+networks:
+  traefik_network:
+    external: true
