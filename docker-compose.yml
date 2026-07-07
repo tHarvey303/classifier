@@ -14,7 +14,7 @@ services:
       - traefik_network # External network for Traefik access
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.classifier.rule=Host(`classifier.tharvey.space`)"
+      - "traefik.http.routers.classifier.rule=Host(`${CLASSIFIER_DOMAIN}`)"
       - "traefik.http.routers.classifier.entrypoints=websecure"
       - "traefik.http.routers.classifier.tls=true"
       # Replace 'myresolver' with your actual cert resolver name from traefik.toml/yaml
@@ -25,7 +25,7 @@ services:
     image: postgres:15-alpine
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
       - POSTGRES_DB=classifier
     volumes:
       - postgres_data:/var/lib/postgresql/data

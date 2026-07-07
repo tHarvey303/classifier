@@ -1,0 +1,18 @@
+# Secrets — never commit these
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Local databases
+*.db
+*.sqlite3
+instance/
+
+# OS / editor
+.DS_Store
+.claude/settings.local.json

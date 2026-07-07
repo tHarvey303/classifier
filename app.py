@@ -1,12 +1,15 @@
+import ast
 import io
 import json
 import math
+import operator
 import os
 import sys
 import logging
 import sqlite3
 import tempfile
 from datetime import datetime as dt
+import numpy as np
 import yaml
 import boto3
 from sqlalchemy import inspect
@@ -40,6 +43,11 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'pool_pre_ping': True}
 
 REGISTRATION_PASSPHRASE = os.environ.get('REGISTRATION_PASSPHRASE')
 
+# Comma-separated usernames that are always granted admin (e.g. ADMIN_USERNAMES=alice,bob)
+ADMIN_USERNAMES = {
+    name.strip() for name in os.environ.get('ADMIN_USERNAMES', '').split(',') if name.strip()
+}
+
 # R2 / S3 Config
 R2_ENDPOINT = os.environ.get('R2_ENDPOINT_URL', '')
 R2_KEY = os.environ.get('R2_ACCESS_KEY_ID')
@@ -68,6 +76,107 @@ s3_client = boto3.client(
 # Keyed by folder name; value is either None (no catalog found) or a dict
 # { 'columns': [...], 'rows': { 'ID_str': { col: val, ... }, ... } }
 _catalog_cache: Dict[str, Optional[Dict]] = {}
+# Raw astropy Table cache (needed for mask expression evaluation)
+_catalog_table_cache: Dict[str, Optional[object]] = {}
+
+
+class TableQueryParser:
+    """Parse a filter expression string and apply it to an astropy Table as a boolean mask.
+
+    Supports: comparisons (<, <=, >, >=, ==, !=), logic (&, |, ^), arithmetic (+, -,
+    *, /), unary (~, -, +), grouping (), functions (log10, log, sqrt, abs, exp), and
+    column indexing (col[i] → col[:, i]).
+    """
+
+    _OPERATORS = {
+        ast.Lt: operator.lt, ast.LtE: operator.le,
+        ast.Gt: operator.gt, ast.GtE: operator.ge,
+        ast.Eq: operator.eq, ast.NotEq: operator.ne,
+        ast.BitAnd: operator.and_, ast.BitOr: operator.or_, ast.BitXor: operator.xor,
+        ast.Add: operator.add, ast.Sub: operator.sub,
+        ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Invert: operator.invert, ast.USub: operator.neg, ast.UAdd: operator.pos,
+    }
+    _FUNCTIONS = {
+        'log10': np.log10, 'log': np.log, 'sqrt': np.sqrt, 'abs': np.abs, 'exp': np.exp,
+    }
+
+    def __init__(self, table):
+        self.table = table
+        self._source = table
+
+    def parse(self, expression: str) -> np.ndarray:
+        """Return a boolean mask array of length len(table)."""
+        if not expression or not expression.strip():
+            return np.ones(len(self.table), dtype=bool)
+        tree = ast.parse(expression, mode='eval')
+        return np.asarray(self._eval(tree.body), dtype=bool)
+
+    def _lookup_column(self, name: str) -> np.ndarray:
+        src = self._source
+        if name in src.colnames:
+            return np.asarray(src[name])
+        raise ValueError(f"Column '{name}' not found. Available: {list(src.colnames)}")
+
+    def _eval_slice(self, node):
+        return slice(
+            self._eval(node.lower) if node.lower is not None else None,
+            self._eval(node.upper) if node.upper is not None else None,
+            self._eval(node.step) if node.step is not None else None,
+        )
+
+    def _eval_index(self, node):
+        if hasattr(ast, 'Index') and isinstance(node, ast.Index):
+            node = node.value
+        if isinstance(node, ast.Slice):
+            return self._eval_slice(node)
+        if isinstance(node, ast.Tuple):
+            return tuple(
+                self._eval_slice(e) if isinstance(e, ast.Slice) else self._eval(e)
+                for e in node.elts
+            )
+        return self._eval(node)
+
+    def _eval(self, node):
+        if isinstance(node, ast.BinOp):
+            op = type(node.op)
+            if op not in self._OPERATORS:
+                raise ValueError(f"Unsupported operator: {op.__name__}")
+            return self._OPERATORS[op](self._eval(node.left), self._eval(node.right))
+        if isinstance(node, ast.Compare):
+            if len(node.ops) > 1:
+                raise ValueError("Chained comparisons not supported; use (a < x) & (x < b).")
+            op = type(node.ops[0])
+            if op not in self._OPERATORS:
+                raise ValueError(f"Unsupported comparison: {op.__name__}")
+            return self._OPERATORS[op](self._eval(node.left), self._eval(node.comparators[0]))
+        if isinstance(node, ast.UnaryOp):
+            op = type(node.op)
+            if op not in self._OPERATORS:
+                raise ValueError(f"Unsupported unary op: {op.__name__}")
+            return self._OPERATORS[op](self._eval(node.operand))
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only simple function calls are supported.")
+            name = node.func.id
+            if name not in self._FUNCTIONS:
+                raise ValueError(f"Unknown function '{name}'. Available: {list(self._FUNCTIONS)}")
+            return self._FUNCTIONS[name](*[self._eval(a) for a in node.args])
+        if isinstance(node, ast.Subscript):
+            base = np.asarray(self._eval(node.value))
+            idx = self._eval_index(node.slice)
+            if isinstance(node.value, ast.Name) and base.ndim >= 2:
+                idx = (slice(None),) + (idx if isinstance(idx, tuple) else (idx,))
+            return base[idx]
+        if isinstance(node, ast.Name):
+            return self._lookup_column(node.id)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Num):   # Python < 3.8
+            return node.n
+        if isinstance(node, ast.Str):   # Python < 3.8
+            return node.s
+        raise TypeError(f"Unsupported syntax node: {type(node).__name__}")
 
 
 def _serialize_fits_value(val):
@@ -121,11 +230,13 @@ def load_catalog_for_folder(folder: str) -> Optional[Dict]:
         except Exception as e:
             logger.error(f"Failed to parse FITS catalog from {key}: {e}")
             _catalog_cache[folder] = None
+            _catalog_table_cache[folder] = None
             return None
 
         if 'ID' not in table.colnames:
             logger.warning(f"Catalog at {key} has no 'ID' column. Columns: {table.colnames}")
             _catalog_cache[folder] = None
+            _catalog_table_cache[folder] = None
             return None
 
         columns = list(table.colnames)
@@ -136,10 +247,12 @@ def load_catalog_for_folder(folder: str) -> Optional[Dict]:
 
         result = {'columns': columns, 'rows': rows}
         _catalog_cache[folder] = result
+        _catalog_table_cache[folder] = table
         logger.info(f"Catalog loaded for folder '{folder}': {len(rows)} rows, columns={columns}")
         return result
 
     _catalog_cache[folder] = None
+    _catalog_table_cache[folder] = None
     return None
 
 
@@ -172,6 +285,13 @@ class Assignment(db.Model):
     created_at = db.Column(db.DateTime, server_default=db.func.now())
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     __table_args__ = (db.UniqueConstraint('user_id', 'folder', name='_user_folder_assignment_uc'),)
+
+class HiddenFolder(db.Model):
+    __tablename__ = 'hidden_folders'
+    id = db.Column(db.Integer, primary_key=True)
+    folder = db.Column(db.String(500), unique=True, nullable=False)
+    hidden_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -263,6 +383,8 @@ ADMIN_TEMPLATE = """
         .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
         .badge-admin { background: #fef3c7; color: #92400e; }
         .badge-user { background: #f3f4f6; color: #6b7280; }
+        .badge-visible { background: #d1fae5; color: #065f46; }
+        .badge-hidden { background: #fee2e2; color: #991b1b; }
         .field-row { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; margin-bottom: 0.75rem; }
         .field { display: flex; flex-direction: column; gap: 3px; }
         .field label { font-size: 0.72rem; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -288,6 +410,7 @@ ADMIN_TEMPLATE = """
     <div class="tabs">
         <button class="tab-btn active" onclick="showTab('users',this)">Users</button>
         <button class="tab-btn" onclick="showTab('assignments',this)">Assignments</button>
+        <button class="tab-btn" onclick="showTab('folders',this)">Folders</button>
     </div>
 
     <div id="tab-users" class="tab-panel active">
@@ -296,6 +419,17 @@ ADMIN_TEMPLATE = """
             <table>
                 <thead><tr><th>Username</th><th>Classifications</th><th>Role</th><th></th></tr></thead>
                 <tbody id="users-tbody"><tr><td colspan="4" style="text-align:center;color:#9ca3af;">Loading&#8230;</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="tab-folders" class="tab-panel">
+        <div class="card">
+            <h2>Folders</h2>
+            <p style="font-size:0.875rem;color:#6b7280;margin:0 0 1rem;">Hidden folders do not appear in the classifier folder list for non-admin users. Admins always see all folders.</p>
+            <table>
+                <thead><tr><th>Folder</th><th>Status</th><th></th></tr></thead>
+                <tbody id="folders-tbody"><tr><td colspan="3" style="text-align:center;color:#9ca3af;">Loading&#8230;</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -351,7 +485,7 @@ ADMIN_TEMPLATE = """
 </div>
 
 <script>
-let adminUsers = [], adminFolderImages = [], splitPreviewData = [];
+let adminUsers = [], adminFolders = [], adminFolderImages = [], splitPreviewData = [];
 
 function showTab(name, btn) {
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -361,9 +495,9 @@ function showTab(name, btn) {
 }
 
 async function init() {
-    const [usersRes, foldersRes] = await Promise.all([fetch('/api/admin/users'), fetch('/api/folders')]);
+    const [usersRes, foldersRes] = await Promise.all([fetch('/api/admin/users'), fetch('/api/admin/folders')]);
     adminUsers = await usersRes.json();
-    const folders = await foldersRes.json();
+    adminFolders = await foldersRes.json();
 
     const tbody = document.getElementById('users-tbody');
     tbody.innerHTML = '';
@@ -371,12 +505,16 @@ async function init() {
         const tr = tbody.insertRow();
         tr.innerHTML = `<td><b>${u.username}</b></td><td>${u.classification_count.toLocaleString()}</td>
             <td><span class="badge ${u.is_admin ? 'badge-admin' : 'badge-user'}" id="rbadge-${u.id}">${u.is_admin ? 'Admin' : 'User'}</span></td>
-            <td><button class="btn btn-grey" id="rtbtn-${u.id}" onclick="toggleAdmin(${u.id})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button></td>`;
+            <td><button class="btn btn-grey" id="rtbtn-${u.id}" onclick="toggleAdmin(${u.id})">${u.is_admin ? 'Revoke admin' : 'Make admin'}</button>
+                <button class="btn btn-red" onclick="deleteUser(${u.id}, '${u.username}', ${u.classification_count})">Delete</button></td>`;
     });
 
+    renderFolders();
+
     const folderSel = document.getElementById('admin-folder-select');
-    folders.forEach(f => {
-        const o = document.createElement('option'); o.value = o.textContent = f;
+    adminFolders.forEach(f => {
+        const o = document.createElement('option'); o.value = f.name;
+        o.textContent = f.hidden ? `${f.name} (hidden)` : f.name;
         folderSel.appendChild(o);
     });
 
@@ -399,6 +537,42 @@ async function toggleAdmin(uid) {
     document.getElementById(`rbadge-${uid}`).className = `badge ${data.is_admin ? 'badge-admin' : 'badge-user'}`;
     document.getElementById(`rbadge-${uid}`).textContent = data.is_admin ? 'Admin' : 'User';
     document.getElementById(`rtbtn-${uid}`).textContent = data.is_admin ? 'Revoke admin' : 'Make admin';
+}
+
+async function deleteUser(uid, username, count) {
+    const warn = count > 0 ? `\\n\\nWARNING: their ${count.toLocaleString()} classification(s) and all assignments will be permanently deleted.` : '';
+    if (!confirm(`Delete account "${username}"? This cannot be undone.${warn}`)) return;
+    const res = await fetch(`/api/admin/users/${uid}`, {method:'DELETE'});
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    location.reload();
+}
+
+function renderFolders() {
+    const tbody = document.getElementById('folders-tbody');
+    tbody.innerHTML = '';
+    if (!adminFolders.length) {
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#9ca3af;">No folders found</td></tr>';
+        return;
+    }
+    adminFolders.forEach(f => {
+        const tr = tbody.insertRow();
+        tr.innerHTML = `<td><b>${f.name}</b></td>
+            <td><span class="badge ${f.hidden ? 'badge-hidden' : 'badge-visible'}">${f.hidden ? 'Hidden' : 'Visible'}</span></td>
+            <td><button class="btn ${f.hidden ? 'btn-green' : 'btn-grey'}" onclick="toggleFolderHidden('${f.name}')">${f.hidden ? 'Unhide' : 'Hide'}</button></td>`;
+    });
+}
+
+async function toggleFolderHidden(folder) {
+    const res = await fetch('/api/admin/folders/toggle_hidden', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({folder})});
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    const f = adminFolders.find(x => x.name === data.folder);
+    if (f) f.hidden = data.hidden;
+    renderFolders();
+    const opt = [...document.getElementById('admin-folder-select').options].find(o => o.value === folder);
+    if (opt) opt.textContent = data.hidden ? `${folder} (hidden)` : folder;
 }
 
 async function loadAssignmentFolder() {
@@ -691,7 +865,12 @@ APP_TEMPLATE = """
         .catalog-sort-row select:last-child { width: auto; }
         .filter-range-row { display: flex; gap: 0.4rem; align-items: center; font-size: 0.85rem; color: var(--text-sub); margin-bottom: 1rem; }
         .filter-range-input { flex: 1; min-width: 0; padding: 5px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 0.85rem; }
-        .catalog-props-box { background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px; margin-bottom: 1rem; font-size: 0.8em; max-height: 180px; overflow-y: auto; display: none; }
+        .mask-expr-row { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.4rem; }
+        .mask-expr-input { display: block; width: 100%; box-sizing: border-box; padding: 5px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 0.82rem; font-family: monospace; margin-bottom: 0.4rem; }
+        .mask-expr-input.error { border-color: #dc2626; }
+        .mask-expr-status { font-size: 0.78rem; color: var(--text-sub); margin-bottom: 0.8rem; min-height: 1.1em; }
+        .mask-expr-status.err { color: #dc2626; }
+        .catalog-props-box { background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px; margin-bottom: 1rem; font-size: 0.8em; min-height: 120px; max-height: 350px; overflow-y: auto; display: none; }
         .catalog-props-box .props-title { font-weight: 700; color: #374151; margin-bottom: 4px; }
         .prop-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px dashed #e5e7eb; }
         .prop-row:last-child { border-bottom: none; }
@@ -715,6 +894,40 @@ APP_TEMPLATE = """
         .btn-close:hover { background:#f3f4f6; }
         .btn-scatter { width:100%; padding:8px; background:#1f2937; color:white; border:none; border-radius:6px; cursor:pointer; margin-bottom:10px; font-weight:600; font-size:0.9rem; }
         .btn-scatter:hover { background:#374151; }
+        .btn-sky { width:100%; padding:8px; background:#0f766e; color:white; border:none; border-radius:6px; cursor:pointer; margin-bottom:10px; font-weight:600; font-size:0.9rem; }
+        .btn-sky:hover { background:#115e59; }
+        .btn-sky.active { background:#134e4a; }
+        .btn-lf { width:100%; padding:8px; background:#9333ea; color:white; border:none; border-radius:6px; cursor:pointer; margin-bottom:10px; font-weight:600; font-size:0.9rem; }
+        .btn-lf:hover { background:#7e22ce; }
+
+        /* Luminosity-function modal */
+        #lf-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:200; align-items:center; justify-content:center; }
+        .lf-panel { background:white; border-radius:12px; padding:1.25rem 1.5rem; width:90vw; height:90vh; max-width:1300px; display:flex; flex-direction:column; gap:0.75rem; box-shadow:0 25px 50px rgba(0,0,0,0.4); }
+        .lf-body { flex:1; min-height:0; display:flex; gap:0.9rem; }
+        #lf-plot { flex:1; min-height:0; }
+        .lf-side { width:260px; flex-shrink:0; border-left:1px solid #e5e7eb; padding-left:0.9rem; display:flex; flex-direction:column; min-height:0; }
+        .lf-side h4 { margin:0 0 0.5rem; font-size:0.9rem; color:var(--text-main); }
+        .lf-gal-list { flex:1; overflow-y:auto; font-size:0.82rem; }
+        .lf-gal-row { display:flex; justify-content:space-between; gap:6px; padding:4px 6px; border-radius:4px; cursor:pointer; }
+        .lf-gal-row:hover { background:#f3e8ff; }
+        .lf-gal-row .gid { font-family:monospace; color:#6b21a8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .lf-gal-row .gval { color:var(--text-sub); white-space:nowrap; }
+        .lf-controls { display:flex; gap:0.7rem; flex-wrap:wrap; align-items:flex-end; background:#f9fafb; padding:0.6rem 0.8rem; border-radius:8px; border:1px solid #e5e7eb; }
+        .lf-ctrl { display:flex; flex-direction:column; gap:3px; }
+        .lf-ctrl label { font-size:0.72rem; font-weight:600; color:var(--text-sub); text-transform:uppercase; letter-spacing:0.04em; }
+        .lf-ctrl select, .lf-ctrl input { padding:5px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:0.88rem; background:white; }
+        .lf-ctrl input.num { width:80px; }
+        .lf-ctrl input.expr { width:200px; font-family:monospace; font-size:0.8rem; }
+        .lf-ctrl-check { display:flex; align-items:center; gap:4px; font-size:0.85rem; color:var(--text-main); padding-bottom:4px; }
+        .lf-status { font-size:0.8rem; color:var(--text-sub); min-height:1.1em; }
+        .lf-status.err { color:#dc2626; }
+        .lf-meta { font-size:0.78rem; color:var(--text-sub); }
+
+        /* Sky position overlay */
+        #sky-overlay { position:absolute; inset:0; background:#f9fafb; z-index:10; display:flex; flex-direction:column; padding:0.75rem 1rem; transform:translateX(-100%); transition:transform 0.25s ease; }
+        #sky-overlay.open { transform:translateX(0); }
+        #sky-overlay-header { display:flex; align-items:center; margin-bottom:0.5rem; }
+        #sky-overlay-title { font-weight:700; font-size:0.95rem; color:#1f2937; }
 
         /* Export section */
         #export-section { margin-bottom:1.5rem; display:none; }
@@ -774,6 +987,13 @@ APP_TEMPLATE = """
 <div class="container">
     <div class="image-area">
         <img id="main-image" src="" alt="Select a folder to begin">
+        <div id="sky-overlay">
+            <div id="sky-overlay-header">
+                <span id="sky-overlay-title">Sky Position</span>
+                <button class="btn-close" onclick="closeSkyPlot()" style="margin-left:auto;">&#10005;</button>
+            </div>
+            <div id="sky-plot-div" style="flex:1;min-height:0;"></div>
+        </div>
     </div>
     
     <div class="sidebar">
@@ -851,9 +1071,23 @@ APP_TEMPLATE = """
                 <input type="checkbox" id="filter-no-catalog" onchange="applyAllFilters()">
                 Show only images not in catalog
             </label>
+
+            <label class="section-label">Mask Expression</label>
+            <input type="text" id="mask-expr-input" class="mask-expr-input"
+                placeholder="e.g. mag &lt; 20 &amp; snr &gt; 5"
+                onkeydown="if(event.key==='Enter') applyMaskExpr()">
+            <div class="mask-expr-row">
+                <button class="btn-secondary" onclick="applyMaskExpr()"
+                    style="flex:1;padding:5px 10px;font-size:0.82rem;">Apply</button>
+                <button class="btn-secondary" onclick="clearMaskExpr()"
+                    style="white-space:nowrap;padding:5px 10px;font-size:0.82rem;" title="Clear mask">&#10005;</button>
+            </div>
+            <div id="mask-expr-status" class="mask-expr-status"></div>
         </div>
         <div id="catalog-loading" class="catalog-loading" style="display:none">Loading catalog&#8230;</div>
         <button id="btn-scatter" class="btn-scatter" onclick="openScatterPlot()" style="display:none">Scatter Plot</button>
+        <button id="btn-lf" class="btn-lf" onclick="openLF()" style="display:none">Luminosity Function (1/Vmax)</button>
+        <button id="btn-sky" class="btn-sky" onclick="toggleSkyPlot()" style="display:none">Sky Position</button>
         <button id="btn-compare" class="btn-compare" onclick="openCompare()" style="display:none">Compare Users</button>
 
         <label class="section-label">Classification</label>
@@ -924,6 +1158,90 @@ APP_TEMPLATE = """
             </div>
         </div>
         <div id="scatter-plot"></div>
+    </div>
+</div>
+
+<!-- Luminosity Function Modal -->
+<div id="lf-modal">
+    <div class="lf-panel">
+        <div class="scatter-header">
+            <div style="display:flex; align-items:center; gap:0.75rem;">
+                <h3 style="margin:0;">1/V<sub>max</sub> Luminosity Function</h3>
+                <span id="lf-meta" class="lf-meta"></span>
+            </div>
+            <button class="btn-close" onclick="closeLF()">&#x2715;</button>
+        </div>
+        <div class="lf-controls">
+            <div class="lf-ctrl">
+                <label>Magnitude column</label>
+                <select id="lf-mag" onchange="runLF()"></select>
+            </div>
+            <div class="lf-ctrl">
+                <label>Redshift column</label>
+                <select id="lf-z" onchange="runLF()"></select>
+            </div>
+            <div class="lf-ctrl">
+                <label>Parent sample</label>
+                <select id="lf-parent" onchange="runLF()"></select>
+            </div>
+            <div class="lf-ctrl">
+                <label>z min</label>
+                <input type="number" id="lf-zmin" class="num" step="0.1" value="0" onchange="runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>z max</label>
+                <input type="number" id="lf-zmax" class="num" step="0.1" value="1" onchange="runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>Area (deg&sup2;)</label>
+                <input type="number" id="lf-area" class="num" step="any" value="1" onchange="runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>Bin width (mag)</label>
+                <input type="number" id="lf-binw" class="num" step="0.1" value="0.5" onchange="runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>H&#8320;</label>
+                <input type="number" id="lf-h0" class="num" step="any" value="70" onchange="runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>&Omega;<sub>m</sub></label>
+                <input type="number" id="lf-om0" class="num" step="any" value="0.3" onchange="runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>Mask cut A <span id="lf-use-mask" style="color:#9333ea;cursor:pointer;text-transform:none;letter-spacing:0;" onclick="lfUseCurrentMask()" title="Copy the sidebar mask expression">&#8631; current</span></label>
+                <input type="text" id="lf-expr-a" class="expr" placeholder="(no cut)" onkeydown="if(event.key==='Enter')runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>Mask cut B (compare)</label>
+                <input type="text" id="lf-expr-b" class="expr" placeholder="(off)" onkeydown="if(event.key==='Enter')runLF()">
+            </div>
+            <div class="lf-ctrl">
+                <label>Options</label>
+                <div style="display:flex; gap:0.6rem; padding-top:3px;">
+                    <label class="lf-ctrl-check"><input type="checkbox" id="lf-logy" checked onchange="renderLF()"> log&#966;</label>
+                    <label class="lf-ctrl-check"><input type="checkbox" id="lf-err" checked onchange="renderLF()"> errors</label>
+                </div>
+            </div>
+            <div class="lf-ctrl">
+                <label>&nbsp;</label>
+                <button class="btn-secondary" style="padding:6px 12px;font-size:0.85rem;" onclick="runLF()">Compute</button>
+            </div>
+            <div class="lf-ctrl">
+                <label>&nbsp;</label>
+                <button class="btn-secondary" style="padding:6px 12px;font-size:0.85rem;" onclick="lfExportCsv()" title="Download binned phi(M) table">&#8595; CSV</button>
+            </div>
+        </div>
+        <div id="lf-status" class="lf-status"></div>
+        <div class="lf-body">
+            <div id="lf-plot"></div>
+            <div class="lf-side">
+                <h4 id="lf-side-title">Click a bin</h4>
+                <div id="lf-gal-list" class="lf-gal-list">
+                    <div style="color:var(--text-sub);font-size:0.82rem;">Click a histogram bin to list the galaxies that contribute to it. Click a galaxy to jump to its image.</div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -1027,35 +1345,38 @@ APP_TEMPLATE = """
     let shuffleMode = false;
     let currentAssignment = null;
     let showAssignedOnly = false;
+    let maskPassIds = null; // null = no mask active; Set<string> = IDs passing the mask expr
     const catColors = {};
+    let raCol = null;
+    let decCol = null;
+    let skyPlotBuilt = false;
+    let lfData = null; // last /api/catalog/vmax response
 
     function getCatColor(cat) { return catColors[cat] || '#6b7280'; }
 
-    async function init() {
-        // 1. Load Config (Categories)
-        const configRes = await fetch('/api/config');
+    async function loadCategories(folder) {
+        const url = folder ? `/api/config?folder=${encodeURIComponent(folder)}` : '/api/config';
+        const configRes = await fetch(url);
         const configData = await configRes.json();
         categories = configData.categories;
-        
-        // Render Category Buttons
+
         const container = document.getElementById('category-container');
+        container.innerHTML = '';
         categories.forEach((cat, index) => {
             const btn = document.createElement('button');
             btn.className = 'btn-cat';
-            // Show Shortcut in label if within 1-9
             if (index < 9) {
                 btn.innerText = `${index + 1}. ${cat}`;
             } else {
                 btn.innerText = cat;
             }
-            
             btn.onclick = () => selectCategory(cat);
             btn.dataset.category = cat;
             container.appendChild(btn);
         });
 
-        // Render Filter Options (category names appended to their optgroup)
         const filterGroup = document.getElementById('filter-group-categories');
+        filterGroup.innerHTML = '';
         categories.forEach(cat => {
             const opt = document.createElement('option');
             opt.value = cat;
@@ -1063,9 +1384,13 @@ APP_TEMPLATE = """
             filterGroup.appendChild(opt);
         });
 
-        // Build category → color map for consistent colour coding across stats/compare
         const _palette = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316','#6366f1'];
         categories.forEach((cat, i) => { catColors[cat] = _palette[i % _palette.length]; });
+    }
+
+    async function init() {
+        // 1. Load Config (Categories)
+        await loadCategories(null);
 
         // 2. Fetch Folders and Users
         await Promise.all([fetchFolders(), fetchUsers()]);
@@ -1197,10 +1522,18 @@ APP_TEMPLATE = """
         currentAssignment = null;
         showAssignedOnly = false;
         shuffleMode = false;
+        maskPassIds = null;
+        document.getElementById('mask-expr-input').value = '';
+        document.getElementById('mask-expr-status').textContent = '';
+        document.getElementById('mask-expr-status').className = 'mask-expr-status';
+        document.getElementById('mask-expr-input').className = 'mask-expr-input';
         document.getElementById('catalog-section').style.display = 'none';
         document.getElementById('btn-scatter').style.display = 'none';
+        document.getElementById('btn-lf').style.display = 'none';
+        document.getElementById('btn-sky').style.display = 'none';
         document.getElementById('catalog-loading').style.display = 'block';
         document.getElementById('catalog-props-box').style.display = 'none';
+        closeSkyPlot();
         document.getElementById('filter-no-catalog').checked = false;
         document.getElementById('export-section').style.display = 'block';
         document.getElementById('btn-compare').style.display = 'block';
@@ -1209,7 +1542,8 @@ APP_TEMPLATE = """
         document.getElementById('btn-shuffle').classList.remove('active');
         document.getElementById('assignment-notice').style.display = 'none';
         document.getElementById('show-assigned-only').checked = false;
-        // Fetch images, catalog, and assignment in parallel
+        // Fetch folder-specific categories (may override defaults), then images/catalog/assignment
+        await loadCategories(currentFolder);
         await Promise.all([fetchImages(), fetchCatalog(), fetchMyAssignment()]);
         document.getElementById('catalog-loading').style.display = 'none';
     }
@@ -1248,11 +1582,15 @@ APP_TEMPLATE = """
         const scatterX = document.getElementById('scatter-x');
         const scatterY = document.getElementById('scatter-y');
         const scatterColor = document.getElementById('scatter-color');
+        const lfMag = document.getElementById('lf-mag');
+        const lfZ = document.getElementById('lf-z');
 
         sortCol.innerHTML = '<option value="">Default Order</option>';
         filterCol.innerHTML = '<option value="">No filter</option>';
         scatterX.innerHTML = '';
         scatterY.innerHTML = '';
+        lfMag.innerHTML = '';
+        lfZ.innerHTML = '';
         // Color-by: keep the two fixed options then add catalog columns
         scatterColor.innerHTML = '<option value="_none">None</option><option value="_classification">Classification</option>';
 
@@ -1264,12 +1602,51 @@ APP_TEMPLATE = """
             scatterColor.appendChild(mkOpt(col, col));
             scatterX.appendChild(mkOpt(col, col));
             scatterY.appendChild(mkOpt(col, col));
+            lfMag.appendChild(mkOpt(col, col));
+            lfZ.appendChild(mkOpt(col, col));
         });
         // Pre-select second non-ID column as default Y axis
         if (scatterY.options.length > 1) scatterY.selectedIndex = 1;
 
+        // Auto-detect default LF magnitude (M_UV) and redshift columns
+        const magPat = /^(m_?uv|muv|abs_?mag_?uv|m_?1500|m1500)$/i;
+        const zPat = /^(z|redshift|z_?phot|zphot|z_?spec|zspec|z_?best|zbest|z_?ml)$/i;
+        let magPick = '', zPick = '';
+        for (const col of catalogData.columns) {
+            if (col === 'ID') continue;
+            if (!magPick && magPat.test(col)) magPick = col;
+            if (!zPick && zPat.test(col)) zPick = col;
+        }
+        if (magPick) lfMag.value = magPick;
+        else if (lfMag.options.length) lfMag.selectedIndex = 0;
+        if (zPick) lfZ.value = zPick;
+        else if (lfZ.options.length) lfZ.selectedIndex = 0;
+
+        // Parent-sample selector: all sources, current sidebar filter, or one classification
+        const lfParent = document.getElementById('lf-parent');
+        lfParent.innerHTML =
+            '<option value="_all">All catalog sources</option>' +
+            '<option value="_filtered">Current sidebar filter</option>';
+        categories.forEach(cat => {
+            const o = document.createElement('option');
+            o.value = '_class:' + cat;
+            o.innerText = 'Classified: ' + cat;
+            lfParent.appendChild(o);
+        });
+
         document.getElementById('catalog-section').style.display = 'block';
         document.getElementById('btn-scatter').style.display = 'block';
+        document.getElementById('btn-lf').style.display = 'block';
+
+        // Detect RA/Dec columns for sky plot
+        raCol = null; decCol = null; skyPlotBuilt = false;
+        const raPat = /^(ra|alpha|alpha_j2000|ra_deg|right_ascension)$/i;
+        const decPat = /^(dec|delta|delta_j2000|dec_deg|declination)$/i;
+        for (const col of catalogData.columns) {
+            if (!raCol && raPat.test(col)) raCol = col;
+            if (!decCol && decPat.test(col)) decCol = col;
+        }
+        document.getElementById('btn-sky').style.display = (raCol && decCol) ? 'block' : 'none';
     }
 
     // Extract filename stem (no extension) to match catalog ID column
@@ -1317,7 +1694,15 @@ APP_TEMPLATE = """
                 result = result.filter(key => !catalogData.rows[getImageId(key)]);
             }
 
-            // 3. Catalog column sort
+            // 3. Mask expression filter (server-computed; IDs not in catalog are kept)
+            if (maskPassIds !== null) {
+                result = result.filter(key => {
+                    const id = getImageId(key);
+                    return !catalogData.rows[id] || maskPassIds.has(id);
+                });
+            }
+
+            // 4. Catalog column sort
             const sortCol = document.getElementById('sort-col').value;
             if (sortCol) {
                 const asc = document.getElementById('sort-dir').value === 'asc';
@@ -1373,6 +1758,58 @@ APP_TEMPLATE = """
     // Keep filterImages() as an alias so the search box oninput still works
     function filterImages() { applyAllFilters(); }
 
+    async function applyMaskExpr() {
+        const input = document.getElementById('mask-expr-input');
+        const statusEl = document.getElementById('mask-expr-status');
+        const expr = input.value.trim();
+        if (!expr) {
+            maskPassIds = null;
+            statusEl.textContent = '';
+            statusEl.className = 'mask-expr-status';
+            input.className = 'mask-expr-input';
+            applyAllFilters();
+            return;
+        }
+        statusEl.className = 'mask-expr-status';
+        statusEl.textContent = 'Applying…';
+        input.className = 'mask-expr-input';
+        try {
+            const res = await fetch('/api/catalog/mask', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({folder: currentFolder, expr})
+            });
+            const data = await res.json();
+            if (!res.ok || data.error) {
+                statusEl.className = 'mask-expr-status err';
+                statusEl.textContent = 'Error: ' + (data.error || res.statusText);
+                input.className = 'mask-expr-input error';
+                maskPassIds = null;
+            } else {
+                maskPassIds = new Set(data.ids);
+                statusEl.className = 'mask-expr-status';
+                statusEl.textContent = data.count.toLocaleString() + ' / ' + data.total.toLocaleString() + ' rows pass';
+                applyAllFilters();
+            }
+        } catch(e) {
+            statusEl.className = 'mask-expr-status err';
+            statusEl.textContent = 'Error: ' + e.message;
+            input.className = 'mask-expr-input error';
+            maskPassIds = null;
+        }
+    }
+
+    function clearMaskExpr() {
+        const input = document.getElementById('mask-expr-input');
+        const statusEl = document.getElementById('mask-expr-status');
+        input.value = '';
+        input.className = 'mask-expr-input';
+        statusEl.textContent = '';
+        statusEl.className = 'mask-expr-status';
+        maskPassIds = null;
+        applyAllFilters();
+    }
+
     // Show the catalog row for the current image
     function updateCatalogProps(key) {
         const box = document.getElementById('catalog-props-box');
@@ -1421,6 +1858,321 @@ APP_TEMPLATE = """
     document.getElementById('scatter-modal').addEventListener('click', e => {
         if (e.target === document.getElementById('scatter-modal')) closeScatterPlot();
     });
+
+    // --- Luminosity Function (1/Vmax) ---
+
+    const LF_COLORS = ['#9333ea', '#0891b2']; // A, B
+
+    async function openLF() {
+        document.getElementById('lf-modal').style.display = 'flex';
+        // Prefill cut A from the active sidebar mask the first time it's empty
+        const exprA = document.getElementById('lf-expr-a');
+        if (!exprA.value) exprA.value = document.getElementById('mask-expr-input').value.trim();
+        // Refresh classifications so a "Classified: …" parent sample is up to date
+        await fetchClassifications();
+        runLF();
+    }
+
+    function closeLF() { document.getElementById('lf-modal').style.display = 'none'; }
+
+    document.getElementById('lf-modal').addEventListener('click', e => {
+        if (e.target === document.getElementById('lf-modal')) closeLF();
+    });
+
+    function lfUseCurrentMask() {
+        document.getElementById('lf-expr-a').value = document.getElementById('mask-expr-input').value.trim();
+        runLF();
+    }
+
+    async function runLF() {
+        if (!catalogData || document.getElementById('lf-modal').style.display !== 'flex') return;
+        const statusEl = document.getElementById('lf-status');
+        const exprA = document.getElementById('lf-expr-a').value.trim();
+        const exprB = document.getElementById('lf-expr-b').value.trim();
+        const exprs = [exprA];
+        if (exprB) exprs.push(exprB);
+
+        // Parent-sample restriction: null = all catalog sources; otherwise a list of
+        // catalog IDs the LF is limited to (current sidebar filter, or one classification).
+        const parent = document.getElementById('lf-parent').value;
+        let restrictIds = null;
+        if (parent === '_filtered') {
+            restrictIds = images.map(getImageId);
+        } else if (parent.startsWith('_class:')) {
+            const wantCat = parent.slice('_class:'.length);
+            restrictIds = Object.keys(classificationMap)
+                .filter(k => classificationMap[k] === wantCat)
+                .map(getImageId);
+        }
+
+        const payload = {
+            folder: currentFolder,
+            mag_col: document.getElementById('lf-mag').value,
+            z_col: document.getElementById('lf-z').value,
+            z_min: parseFloat(document.getElementById('lf-zmin').value),
+            z_max: parseFloat(document.getElementById('lf-zmax').value),
+            area_deg2: parseFloat(document.getElementById('lf-area').value),
+            bin_width: parseFloat(document.getElementById('lf-binw').value),
+            H0: parseFloat(document.getElementById('lf-h0').value),
+            Om0: parseFloat(document.getElementById('lf-om0').value),
+            exprs,
+            restrict_ids: restrictIds,
+        };
+
+        statusEl.className = 'lf-status';
+        statusEl.textContent = 'Computing…';
+        try {
+            const res = await fetch('/api/catalog/vmax', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (!res.ok || data.error) {
+                statusEl.className = 'lf-status err';
+                statusEl.textContent = 'Error: ' + (data.error || res.statusText);
+                lfData = null;
+                return;
+            }
+            lfData = data;
+            const vmaxExp = data.vmax.toExponential(3);
+            document.getElementById('lf-meta').innerHTML =
+                `V<sub>max</sub> = ${vmaxExp} Mpc³ &nbsp;·&nbsp; shell ${data.volume_mpc3.toExponential(2)} Mpc³ &nbsp;·&nbsp; sky frac ${data.sky_frac.toExponential(2)}`;
+            const counts = data.series.map((s, i) => `${String.fromCharCode(65 + i)}: ${s.count.toLocaleString()} gal`).join(' · ');
+            statusEl.className = 'lf-status';
+            statusEl.textContent = counts;
+            // Reset the side panel since bins changed
+            document.getElementById('lf-side-title').textContent = 'Click a bin';
+            document.getElementById('lf-gal-list').innerHTML =
+                '<div style="color:var(--text-sub);font-size:0.82rem;">Click a histogram bin to list contributing galaxies.</div>';
+            renderLF();
+        } catch (e) {
+            statusEl.className = 'lf-status err';
+            statusEl.textContent = 'Error: ' + e.message;
+            lfData = null;
+        }
+    }
+
+    function renderLF() {
+        if (!lfData) return;
+        const logY = document.getElementById('lf-logy').checked;
+        const showErr = document.getElementById('lf-err').checked;
+        const magCol = document.getElementById('lf-mag').value;
+
+        const traces = [];
+        let xLo = Infinity, xHi = -Infinity;
+        lfData.series.forEach((s, si) => {
+            if (!s.bins.length) return;
+            const color = LF_COLORS[si % LF_COLORS.length];
+            s.bins.forEach(b => { if (b.lo < xLo) xLo = b.lo; if (b.hi > xHi) xHi = b.hi; });
+            const xs = s.bins.map(b => b.center);
+            const ys = s.bins.map(b => b.phi);
+            const errs = s.bins.map(b => b.phi_err);
+            const name = s.expr ? `${String.fromCharCode(65 + si)}: ${s.expr}` : `${String.fromCharCode(65 + si)}: all`;
+            traces.push({
+                type: 'scatter', mode: 'lines+markers', name,
+                x: xs, y: ys,
+                customdata: s.bins.map(b => [si, b.count, b.lo, b.hi]),
+                error_y: showErr ? { type: 'data', array: errs, visible: true, thickness: 1, width: 3, color } : { visible: false },
+                line: { shape: 'hv', color, width: 2 },
+                marker: { size: 8, color },
+                hovertemplate: `${magCol}=%{x:.2f}<br>φ=%{y:.3e}<br>N=%{customdata[1]}<extra>${name}</extra>`,
+            });
+        });
+
+        // Force the magnitude axis to run high → low (left to right).
+        const xPad = isFinite(xLo) ? (xHi - xLo) * 0.04 + 0.1 : 1;
+        const xRange = isFinite(xLo) ? [xHi + xPad, xLo - xPad] : undefined;
+
+        const layout = {
+            xaxis: { title: magCol + ' (mag)', range: xRange, autorange: xRange ? false : 'reversed', showgrid: true, gridcolor: '#e5e7eb', zeroline: false },
+            yaxis: { title: 'φ  (Mpc⁻³ mag⁻¹)', type: logY ? 'log' : 'linear', showgrid: true, gridcolor: '#e5e7eb', zeroline: false },
+            margin: { l: 75, r: 20, t: 15, b: 55 },
+            hovermode: 'closest',
+            paper_bgcolor: 'white',
+            plot_bgcolor: '#f9fafb',
+            legend: { orientation: 'h', x: 0, y: 1.05, xanchor: 'left', yanchor: 'bottom' },
+            font: { family: '-apple-system, sans-serif', size: 12 },
+        };
+        const config = { responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['toImage'] };
+
+        const plotDiv = document.getElementById('lf-plot');
+        Plotly.react(plotDiv, traces, layout, config);
+
+        // Re-binding on every react() would stack handlers; clear first.
+        if (plotDiv.removeAllListeners) plotDiv.removeAllListeners('plotly_click');
+        plotDiv.on('plotly_click', evt => {
+            if (!evt.points.length) return;
+            const cd = evt.points[0].customdata; // [seriesIdx, count, lo, hi]
+            showLFBinGalaxies(cd[0], evt.points[0].x, cd[2], cd[3]);
+        });
+    }
+
+    function showLFBinGalaxies(seriesIdx, center, lo, hi) {
+        if (!lfData) return;
+        const gals = lfData.galaxies[seriesIdx] || [];
+        const series = lfData.series[seriesIdx];
+        // Find the bin index whose center matches the clicked point
+        let binIdx = -1;
+        series.bins.forEach((b, i) => { if (Math.abs(b.center - center) < 1e-6) binIdx = i; });
+        const members = gals.filter(g => g.bin === binIdx);
+
+        const label = String.fromCharCode(65 + seriesIdx);
+        document.getElementById('lf-side-title').textContent =
+            `Cut ${label}: ${lo.toFixed(2)} ≤ ${document.getElementById('lf-mag').value} < ${hi.toFixed(2)} — ${members.length} gal`;
+
+        const list = document.getElementById('lf-gal-list');
+        if (!members.length) {
+            list.innerHTML = '<div style="color:var(--text-sub);font-size:0.82rem;">No galaxies in this bin.</div>';
+            return;
+        }
+        list.innerHTML = '';
+        members.forEach(g => {
+            const inImages = images.some(k => getImageId(k) === g.id);
+            const row = document.createElement('div');
+            row.className = 'lf-gal-row';
+            row.title = inImages ? 'Jump to this image' : 'Not in the current image list';
+            if (!inImages) row.style.opacity = '0.5';
+            row.innerHTML = `<span class="gid">${g.id}</span><span class="gval">${g.mag.toFixed(2)} · z=${g.z.toFixed(2)}</span>`;
+            if (inImages) row.onclick = () => navigateToGalaxyId(g.id);
+            list.appendChild(row);
+        });
+    }
+
+    function navigateToGalaxyId(id) {
+        const key = images.find(k => getImageId(k) === id);
+        if (!key) return;
+        const idx = images.indexOf(key);
+        if (idx !== -1) { loadStateForImage(idx); closeLF(); }
+    }
+
+    function lfExportCsv() {
+        if (!lfData) return;
+        let csv = 'cut,mag_center,mag_lo,mag_hi,count,phi,phi_err\\n';
+        lfData.series.forEach((s, si) => {
+            const label = String.fromCharCode(65 + si);
+            s.bins.forEach(b => {
+                csv += `${label},${b.center},${b.lo},${b.hi},${b.count},${b.phi},${b.phi_err}\\n`;
+            });
+        });
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `lumfunc_${currentFolder}.csv`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    // --- Sky Position Plot ---
+
+    function toggleSkyPlot() {
+        const overlay = document.getElementById('sky-overlay');
+        if (overlay.classList.contains('open')) {
+            closeSkyPlot();
+        } else {
+            openSkyPlot();
+        }
+    }
+
+    function openSkyPlot() {
+        const overlay = document.getElementById('sky-overlay');
+        overlay.classList.add('open');
+        document.getElementById('btn-sky').classList.add('active');
+        if (!skyPlotBuilt) {
+            buildSkyPlot();
+        } else {
+            updateSkyHighlight();
+        }
+    }
+
+    function closeSkyPlot() {
+        document.getElementById('sky-overlay').classList.remove('open');
+        document.getElementById('btn-sky').classList.remove('active');
+    }
+
+    function buildSkyPlot() {
+        if (!catalogData || !raCol || !decCol) return;
+
+        // Build all-sources trace
+        const allRa = [], allDec = [], allKeys = [], allText = [];
+        for (const [id, row] of Object.entries(catalogData.rows)) {
+            const ra = row[raCol], dec = row[decCol];
+            if (ra === null || ra === undefined || dec === null || dec === undefined) continue;
+            allRa.push(ra); allDec.push(dec); allKeys.push(id);
+            allText.push(`${id}<br>${raCol}: ${Number(ra).toFixed(5)}<br>${decCol}: ${Number(dec).toFixed(5)}`);
+        }
+
+        // Cosine correction: at declination δ, 1° RA = cos(δ)° of arc.
+        // scaleratio = 1/cos(δ_mean) makes 1° Dec span the same screen height as cos(δ)° RA spans width.
+        const meanDec = allDec.length ? allDec.reduce((a, b) => a + b, 0) / allDec.length : 0;
+        const cosDec = Math.cos(meanDec * Math.PI / 180);
+        const skyScaleRatio = cosDec > 0.001 ? 1 / cosDec : 1;
+
+        const currentKey = currentIndex >= 0 && currentIndex < images.length ? images[currentIndex] : null;
+        const currentId = currentKey ? getImageId(currentKey) : null;
+        const curRow = currentId && catalogData.rows[currentId] ? catalogData.rows[currentId] : null;
+
+        const traces = [
+            {
+                type: 'scatter', mode: 'markers', name: 'All sources',
+                x: allRa, y: allDec,
+                customdata: allKeys,
+                text: allText,
+                hovertemplate: '%{text}<extra></extra>',
+                marker: { size: 5, color: '#94a3b8', opacity: 0.7 }
+            },
+            {
+                type: 'scatter', mode: 'markers', name: 'Current',
+                x: curRow ? [curRow[raCol]] : [],
+                y: curRow ? [curRow[decCol]] : [],
+                customdata: curRow ? [currentId] : [],
+                hovertemplate: curRow ? `${currentId}<br>${raCol}: ${Number(curRow[raCol]).toFixed(5)}<br>${decCol}: ${Number(curRow[decCol]).toFixed(5)}<extra>current</extra>` : '<extra></extra>',
+                marker: { size: 14, color: '#ef4444', symbol: 'star', opacity: 1, line: { width: 1, color: '#7f1d1d' } }
+            }
+        ];
+
+        const layout = {
+            xaxis: { title: raCol + ' (deg)', autorange: 'reversed', showgrid: true, gridcolor: '#e5e7eb', zeroline: false },
+            yaxis: { title: decCol + ' (deg)', showgrid: true, gridcolor: '#e5e7eb', zeroline: false, scaleanchor: 'x', scaleratio: skyScaleRatio },
+            margin: { l: 55, r: 15, t: 10, b: 50 },
+            hovermode: 'closest',
+            paper_bgcolor: '#f9fafb',
+            plot_bgcolor: '#f9fafb',
+            legend: { orientation: 'h', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom' },
+            font: { family: '-apple-system, sans-serif', size: 11 }
+        };
+        const config = { responsive: true, displayModeBar: false };
+
+        const plotDiv = document.getElementById('sky-plot-div');
+        Plotly.newPlot(plotDiv, traces, layout, config);
+        skyPlotBuilt = true;
+
+        plotDiv.on('plotly_click', function(data) {
+            if (!data.points.length) return;
+            const clickedId = data.points[0].customdata;
+            const key = images.find(k => getImageId(k) === clickedId);
+            if (!key) return;
+            const idx = images.indexOf(key);
+            if (idx !== -1) loadStateForImage(idx);
+        });
+    }
+
+    function updateSkyHighlight() {
+        if (!skyPlotBuilt || !raCol || !decCol) return;
+        const plotDiv = document.getElementById('sky-plot-div');
+        const currentKey = currentIndex >= 0 && currentIndex < images.length ? images[currentIndex] : null;
+        const currentId = currentKey ? getImageId(currentKey) : null;
+        const curRow = currentId && catalogData && catalogData.rows[currentId] ? catalogData.rows[currentId] : null;
+
+        Plotly.restyle(plotDiv, {
+            x: [curRow ? [curRow[raCol]] : []],
+            y: [curRow ? [curRow[decCol]] : []],
+            customdata: [curRow ? [currentId] : []],
+            hovertemplate: [curRow
+                ? `${currentId}<br>${raCol}: ${Number(curRow[raCol]).toFixed(5)}<br>${decCol}: ${Number(curRow[decCol]).toFixed(5)}<extra>current</extra>`
+                : '<extra></extra>']
+        }, [1]);
+    }
 
     // --- Compare Users ---
 
@@ -1892,6 +2644,11 @@ APP_TEMPLATE = """
         // Show catalog properties for this image
         updateCatalogProps(key);
 
+        // Update sky plot highlight if panel is open
+        if (document.getElementById('sky-overlay').classList.contains('open')) {
+            updateSkyHighlight();
+        }
+
         // Refresh stats if open
         if (showStats) {
             fetchStats();
@@ -2003,10 +2760,11 @@ def login():
             if REGISTRATION_PASSPHRASE and passphrase != REGISTRATION_PASSPHRASE:
                 flash("Invalid Registration Key. Please contact administrator.")
             else:
-                # Create Account — first registered user becomes admin
+                # Create Account — first registered user becomes admin,
+                # as does anyone listed in ADMIN_USERNAMES
                 is_first = User.query.count() == 0
                 new_user = User(username=username, password_hash=generate_password_hash(password),
-                                is_admin=is_first)
+                                is_admin=is_first or username in ADMIN_USERNAMES)
                 db.session.add(new_user)
                 db.session.commit()
                 login_user(new_user)
@@ -2037,18 +2795,36 @@ def get_users():
 @app.route('/api/config')
 @login_required
 def get_config():
+    base_config = {"categories": ["Good", "Bad"]}
     if os.path.exists("config.yaml"):
         with open("config.yaml", 'r') as f:
-            return jsonify(yaml.safe_load(f))
-    return jsonify({"categories": ["Good", "Bad"]})
+            base_config = yaml.safe_load(f)
 
-@app.route('/api/folders')
-@login_required
-def get_folders():
-    """Lists subdirectories under classifier/"""
-    logger.info("Request: /api/folders started")
+    folder = request.args.get('folder', '').strip()
+    if folder:
+        candidates = [
+            f"classifier/{folder}/config.yaml",
+            f"{folder}/config.yaml",
+        ]
+        for key in candidates:
+            try:
+                obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+                folder_config = yaml.safe_load(obj['Body'].read())
+                if folder_config and 'categories' in folder_config:
+                    logger.info(f"Using folder-specific config from R2 key: {key}")
+                    return jsonify(folder_config)
+            except ClientError as e:
+                if e.response['Error']['Code'] not in ('NoSuchKey', '404'):
+                    logger.error(f"S3 error fetching config {key}: {e}")
+            except Exception as e:
+                logger.error(f"Error fetching folder config {key}: {e}")
+
+    return jsonify(base_config)
+
+def list_r2_folders() -> List[str]:
+    """Lists subdirectories under classifier/ (falling back to the bucket root)."""
     folders = []
-    
+
     # 1. Try finding folders under 'classifier/'
     try:
         response = s3_client.list_objects_v2(
@@ -2081,6 +2857,18 @@ def get_folders():
              logger.error(f"Error listing root prefix: {e}", exc_info=True)
 
     folders.sort()
+    return folders
+
+
+@app.route('/api/folders')
+@login_required
+def get_folders():
+    """Lists folders, excluding hidden ones for non-admin users."""
+    logger.info("Request: /api/folders started")
+    folders = list_r2_folders()
+    if not current_user.is_admin:
+        hidden = {h.folder for h in HiddenFolder.query.all()}
+        folders = [f for f in folders if f not in hidden]
     logger.info(f"Returning folders: {folders}")
     return jsonify(folders)
 
@@ -2097,6 +2885,177 @@ def get_catalog():
         return jsonify({'available': False})
 
     return jsonify({'available': True, 'columns': catalog['columns'], 'rows': catalog['rows']})
+
+
+@app.route('/api/catalog/mask', methods=['POST'])
+@login_required
+def catalog_mask():
+    """Evaluate a mask expression against the catalog and return the passing IDs."""
+    data = request.get_json(force=True) or {}
+    folder = data.get('folder', '').strip()
+    expr = data.get('expr', '').strip()
+    if not folder:
+        return jsonify({'error': 'No folder specified'}), 400
+
+    # Ensure catalog is loaded so the table cache is populated
+    load_catalog_for_folder(folder)
+    table = _catalog_table_cache.get(folder)
+    if table is None:
+        return jsonify({'error': 'No catalog available for this folder'}), 404
+
+    try:
+        parser = TableQueryParser(table)
+        mask = parser.parse(expr)
+        ids = [str(_serialize_fits_value(table['ID'][i])) for i in range(len(table)) if mask[i]]
+        return jsonify({'count': int(mask.sum()), 'total': len(table), 'ids': ids})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+FULL_SKY_DEG2 = 41252.96124941927  # 4*pi steradians expressed in square degrees
+
+
+@app.route('/api/catalog/vmax', methods=['POST'])
+@login_required
+def catalog_vmax():
+    """Compute a 1/Vmax luminosity function over the catalog.
+
+    Shared-shell Vmax: every selected galaxy is assumed detectable out to
+    z_max, so Vmax is the comoving volume of the [z_min, z_max] shell over the
+    survey area, identical for all galaxies.  phi(M) = N(M) / (Vmax * dM),
+    with Poisson errors sqrt(N) / (Vmax * dM).
+
+    Accepts up to two mask expressions (``exprs``) so the client can overlay
+    two cuts.  An empty expression means "no cut".
+    """
+    data = request.get_json(force=True) or {}
+    folder = (data.get('folder') or '').strip()
+    if not folder:
+        return jsonify({'error': 'No folder specified'}), 400
+
+    load_catalog_for_folder(folder)
+    table = _catalog_table_cache.get(folder)
+    if table is None:
+        return jsonify({'error': 'No catalog available for this folder'}), 404
+
+    mag_col = (data.get('mag_col') or '').strip()
+    z_col = (data.get('z_col') or '').strip()
+    if mag_col not in table.colnames:
+        return jsonify({'error': f"Magnitude column '{mag_col}' not found"}), 400
+    if z_col not in table.colnames:
+        return jsonify({'error': f"Redshift column '{z_col}' not found"}), 400
+
+    try:
+        z_min = float(data.get('z_min'))
+        z_max = float(data.get('z_max'))
+        area_deg2 = float(data.get('area_deg2'))
+        bin_width = float(data.get('bin_width'))
+        H0 = float(data.get('H0', 70.0))
+        Om0 = float(data.get('Om0', 0.3))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'z range, area, bin width and cosmology must be numbers'}), 400
+
+    if not (z_min >= 0 and z_max > z_min):
+        return jsonify({'error': 'Require 0 <= z_min < z_max'}), 400
+    if area_deg2 <= 0:
+        return jsonify({'error': 'Survey area must be positive'}), 400
+    if bin_width <= 0:
+        return jsonify({'error': 'Bin width must be positive'}), 400
+
+    # --- Comoving shell volume over the survey area ---
+    try:
+        from astropy.cosmology import FlatLambdaCDM
+        import astropy.units as u
+        cosmo = FlatLambdaCDM(H0=H0, Om0=Om0)
+        vc_max = cosmo.comoving_volume(z_max).to(u.Mpc ** 3).value
+        vc_min = cosmo.comoving_volume(z_min).to(u.Mpc ** 3).value
+    except Exception as exc:
+        return jsonify({'error': f'Cosmology error: {exc}'}), 400
+
+    sky_frac = area_deg2 / FULL_SKY_DEG2
+    vmax = (vc_max - vc_min) * sky_frac
+    if vmax <= 0:
+        return jsonify({'error': 'Computed Vmax is non-positive'}), 400
+
+    mag_all = np.asarray(table[mag_col], dtype=float)
+    z_all = np.asarray(table[z_col], dtype=float)
+    ids_all = [str(_serialize_fits_value(table['ID'][i])) for i in range(len(table))]
+    z_select = np.isfinite(z_all) & (z_all >= z_min) & (z_all <= z_max)
+
+    # Optional parent-sample restriction to a set of catalog IDs (current sidebar
+    # filter, or a classification such as "robust").  None = no restriction.
+    restrict = data.get('restrict_ids', None)
+    if restrict is not None:
+        rset = {str(x) for x in restrict}
+        z_select = z_select & np.array([rid in rset for rid in ids_all], dtype=bool)
+
+    exprs = data.get('exprs') or ['']
+    if not isinstance(exprs, list):
+        exprs = [exprs]
+    exprs = exprs[:2] if exprs else ['']
+
+    parser = TableQueryParser(table)
+    series = []
+    galaxies = []
+    for expr in exprs:
+        expr = (expr or '').strip()
+        try:
+            emask = np.asarray(parser.parse(expr), dtype=bool)
+        except Exception as exc:
+            return jsonify({'error': f"Expression '{expr}': {exc}"}), 400
+
+        sel = z_select & np.isfinite(mag_all) & emask
+        n = int(sel.sum())
+        if n == 0:
+            series.append({'expr': expr, 'count': 0, 'bins': []})
+            galaxies.append([])
+            continue
+
+        mags = mag_all[sel]
+        idx = np.where(sel)[0]
+        lo = math.floor(mags.min() / bin_width) * bin_width
+        hi = math.ceil(mags.max() / bin_width) * bin_width
+        nbins = max(1, int(round((hi - lo) / bin_width)))
+        edges = lo + bin_width * np.arange(nbins + 1)
+        counts, _ = np.histogram(mags, bins=edges)
+
+        norm = vmax * bin_width
+        bins = []
+        for b in range(nbins):
+            c = int(counts[b])
+            bins.append({
+                'center': round(float(edges[b] + bin_width / 2.0), 4),
+                'lo': round(float(edges[b]), 4),
+                'hi': round(float(edges[b + 1]), 4),
+                'count': c,
+                'phi': c / norm,
+                'phi_err': math.sqrt(c) / norm,
+            })
+        series.append({'expr': expr, 'count': n, 'bins': bins})
+
+        bin_of = np.clip(np.floor((mags - lo) / bin_width).astype(int), 0, nbins - 1)
+        gl = [{
+            'id': ids_all[gi],
+            'mag': round(float(mag_all[gi]), 4),
+            'z': round(float(z_all[gi]), 4),
+            'bin': int(bin_of[k]),
+        } for k, gi in enumerate(idx)]
+        galaxies.append(gl)
+
+    return jsonify({
+        'vmax': vmax,
+        'volume_mpc3': vc_max - vc_min,
+        'sky_frac': sky_frac,
+        'series': series,
+        'galaxies': galaxies,
+    })
+
+
+def folder_hidden_for_current_user(folder: str) -> bool:
+    """True if the folder is hidden and the current user is not an admin."""
+    if current_user.is_admin:
+        return False
+    return HiddenFolder.query.filter_by(folder=folder).first() is not None
 
 
 def list_all_image_keys(prefix: str) -> List[str]:
@@ -2121,6 +3080,8 @@ def get_images():
     folder = request.args.get('folder')
     logger.info(f"Request: /api/images started for folder: {folder}")
     if not folder:
+        return jsonify([])
+    if folder_hidden_for_current_user(folder):
         return jsonify([])
 
     try:
@@ -2540,6 +3501,58 @@ def admin_toggle_admin(uid):
     return jsonify({'is_admin': user.is_admin})
 
 
+@app.route('/api/admin/users/<int:uid>', methods=['DELETE'])
+@login_required
+@admin_required
+def admin_delete_user(uid):
+    if uid == current_user.id:
+        return jsonify({'error': 'Cannot delete your own account'}), 400
+    user = User.query.get(uid)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    deleted_name = user.username
+    try:
+        Classification.query.filter_by(user_id=uid).delete()
+        Assignment.query.filter_by(user_id=uid).delete()
+        Assignment.query.filter_by(created_by=uid).update({'created_by': None})
+        HiddenFolder.query.filter_by(hidden_by=uid).update({'hidden_by': None})
+        db.session.delete(user)
+        db.session.commit()
+        logger.info(f"Admin '{current_user.username}' deleted user '{deleted_name}'")
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"User delete error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/folders')
+@login_required
+@admin_required
+def admin_get_folders():
+    """All folders (including hidden), with hidden status."""
+    hidden = {h.folder for h in HiddenFolder.query.all()}
+    return jsonify([{'name': f, 'hidden': f in hidden} for f in list_r2_folders()])
+
+
+@app.route('/api/admin/folders/toggle_hidden', methods=['POST'])
+@login_required
+@admin_required
+def admin_toggle_folder_hidden():
+    folder = (request.json or {}).get('folder', '').strip()
+    if not folder:
+        return jsonify({'error': 'No folder specified'}), 400
+    record = HiddenFolder.query.filter_by(folder=folder).first()
+    if record:
+        db.session.delete(record)
+        hidden = False
+    else:
+        db.session.add(HiddenFolder(folder=folder, hidden_by=current_user.id))
+        hidden = True
+    db.session.commit()
+    return jsonify({'folder': folder, 'hidden': hidden})
+
+
 @app.route('/api/admin/assignments')
 @login_required
 @admin_required
@@ -2875,22 +3888,38 @@ def get_compare():
         return jsonify({'error': 'Database error'}), 500
 
 
-# Create DB tables and run lightweight column migrations
+# Create DB tables and run lightweight column migrations.
+# Each operation is wrapped independently so a race-condition failure in one
+# (multiple Gunicorn workers starting simultaneously) doesn't block the others.
 with app.app_context():
     try:
-        inspector = inspect(db.engine)
-        db.create_all()  # creates any missing tables (assignments, etc.)
-
-        # Add is_admin column to existing users tables that predate this feature
-        if inspector.has_table("users"):
-            existing_cols = {c['name'] for c in inspector.get_columns('users')}
-            if 'is_admin' not in existing_cols:
-                with db.engine.connect() as conn:
-                    conn.execute(db.text('ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT 0'))
-                    conn.commit()
-                    logger.info("Migrated users table: added is_admin column")
+        db.create_all()
     except Exception as e:
-        logger.warning(f"DB init: {e}")
+        logger.warning(f"DB create_all (likely race condition): {e}")
+
+    try:
+        inspector = inspect(db.engine)
+        if inspector.has_table("users"):
+            cols = {c['name'] for c in inspector.get_columns('users')}
+            if 'is_admin' not in cols:
+                with db.engine.connect() as conn:
+                    # 'false' works in both PostgreSQL and modern SQLite
+                    conn.execute(db.text('ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT false'))
+                    conn.commit()
+                    logger.info("Migrated: added is_admin column to users")
+    except Exception as e:
+        logger.warning(f"DB migration (is_admin): {e}")
+
+    try:
+        if ADMIN_USERNAMES:
+            promoted = User.query.filter(
+                User.username.in_(ADMIN_USERNAMES), User.is_admin.is_(False)
+            ).update({'is_admin': True}, synchronize_session=False)
+            db.session.commit()
+            if promoted:
+                logger.info(f"Promoted {promoted} user(s) to admin via ADMIN_USERNAMES")
+    except Exception as e:
+        logger.warning(f"ADMIN_USERNAMES promotion: {e}")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
