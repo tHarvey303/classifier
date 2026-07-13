@@ -20,7 +20,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from werkzeug.security import generate_password_hash, check_password_hash
 from botocore.client import Config
 from botocore.exceptions import ClientError
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from functools import wraps
 
 # --- Load Environment Variables from .env ---
@@ -78,6 +78,12 @@ s3_client = boto3.client(
 _catalog_cache: Dict[str, Optional[Dict]] = {}
 # Raw astropy Table cache (needed for mask expression evaluation)
 _catalog_table_cache: Dict[str, Optional[object]] = {}
+# (key, ETag) of the R2 object the above two caches were parsed from, or
+# (None, None) if no catalog.fits was found for that folder. Checked via a
+# cheap head_object on every call so a catalog uploaded (or fixed) after the
+# folder was first requested is picked up without needing a server restart.
+_catalog_meta_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+_CATALOG_META_UNSET = object()
 
 
 class TableQueryParser:
@@ -198,62 +204,84 @@ def load_catalog_for_folder(folder: str) -> Optional[Dict]:
     """
     Download catalog.fits from R2 for the given folder and parse it.
     The catalog must contain an 'ID' column whose values match image filenames
-    (without extension).  Results are cached in _catalog_cache.
+    (without extension).  Parsed results are cached in _catalog_cache, but the
+    cache is validated on every call against a cheap head_object (key + ETag)
+    so a catalog that is uploaded, replaced, or fixed after the folder was
+    first requested is picked up on the next request instead of being stuck
+    behind a stale in-memory result until the process restarts.
     """
-    if folder in _catalog_cache:
-        return _catalog_cache[folder]
-
     candidates = [
         f"classifier/{folder}/catalog.fits",
         f"{folder}/catalog.fits",
     ]
 
+    found_key = None
+    found_etag = None
     for key in candidates:
         try:
-            obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
-            fits_bytes = obj['Body'].read()
-            logger.info(f"Downloaded catalog from R2 key: {key} ({len(fits_bytes)} bytes)")
+            head = s3_client.head_object(Bucket=BUCKET_NAME, Key=key)
+            found_key = key
+            found_etag = head.get('ETag')
+            break
         except ClientError as e:
             code = e.response['Error']['Code']
             if code in ('NoSuchKey', '404'):
-                logger.info(f"No catalog at key: {key}")
                 continue
-            logger.error(f"S3 error fetching catalog {key}: {e}")
+            logger.error(f"S3 error checking catalog {key}: {e}")
             continue
         except Exception as e:
-            logger.error(f"Unexpected error fetching catalog {key}: {e}")
+            logger.error(f"Unexpected error checking catalog {key}: {e}")
             continue
 
-        try:
-            from astropy.table import Table
-            table = Table.read(io.BytesIO(fits_bytes))
-        except Exception as e:
-            logger.error(f"Failed to parse FITS catalog from {key}: {e}")
-            _catalog_cache[folder] = None
-            _catalog_table_cache[folder] = None
-            return None
+    current_meta = (found_key, found_etag)
+    if _catalog_meta_cache.get(folder, _CATALOG_META_UNSET) == current_meta:
+        return _catalog_cache.get(folder)
 
-        if 'ID' not in table.colnames:
-            logger.warning(f"Catalog at {key} has no 'ID' column. Columns: {table.colnames}")
-            _catalog_cache[folder] = None
-            _catalog_table_cache[folder] = None
-            return None
+    if found_key is None:
+        logger.info(f"No catalog found for folder '{folder}'")
+        _catalog_cache[folder] = None
+        _catalog_table_cache[folder] = None
+        _catalog_meta_cache[folder] = current_meta
+        return None
 
-        columns = list(table.colnames)
-        rows: Dict[str, Dict] = {}
-        for row in table:
-            row_id = str(_serialize_fits_value(row['ID']))
-            rows[row_id] = {col: _serialize_fits_value(row[col]) for col in columns}
+    try:
+        obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=found_key)
+        fits_bytes = obj['Body'].read()
+        logger.info(f"Downloaded catalog from R2 key: {found_key} ({len(fits_bytes)} bytes)")
+    except Exception as e:
+        # Transient fetch error: don't cache anything so the next call retries.
+        logger.error(f"Unexpected error fetching catalog {found_key}: {e}")
+        return None
 
-        result = {'columns': columns, 'rows': rows}
-        _catalog_cache[folder] = result
-        _catalog_table_cache[folder] = table
-        logger.info(f"Catalog loaded for folder '{folder}': {len(rows)} rows, columns={columns}")
-        return result
+    try:
+        from astropy.table import Table
+        table = Table.read(io.BytesIO(fits_bytes))
+    except Exception as e:
+        logger.error(f"Failed to parse FITS catalog from {found_key}: {e}")
+        _catalog_cache[folder] = None
+        _catalog_table_cache[folder] = None
+        _catalog_meta_cache[folder] = current_meta
+        return None
 
-    _catalog_cache[folder] = None
-    _catalog_table_cache[folder] = None
-    return None
+    if 'ID' not in table.colnames:
+        logger.warning(f"Catalog at {found_key} has no 'ID' column. Columns: {table.colnames}")
+        _catalog_cache[folder] = None
+        _catalog_table_cache[folder] = None
+        _catalog_meta_cache[folder] = current_meta
+        return None
+
+    columns = list(table.colnames)
+    rows: Dict[str, Dict] = {}
+    for row in table:
+        row_id = str(_serialize_fits_value(row['ID']))
+        rows[row_id] = {col: _serialize_fits_value(row[col]) for col in columns}
+
+    result = {'columns': columns, 'rows': rows}
+    _catalog_cache[folder] = result
+    _catalog_table_cache[folder] = table
+    _catalog_meta_cache[folder] = current_meta
+    logger.info(f"Catalog loaded for folder '{folder}': {len(rows)} rows, columns={columns}")
+    return result
 
 
 # --- Database Models ---
