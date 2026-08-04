@@ -1145,6 +1145,7 @@ APP_TEMPLATE = """
         </div>
 
         <button id="btn-shuffle" class="btn-secondary" onclick="toggleShuffle()" style="display:none; margin-bottom:0.5rem;">Shuffle</button>
+        <button id="btn-autoscroll" class="btn-secondary" onclick="toggleAutoscroll()" style="display:none; margin-bottom:0.5rem;" title="After classifying, jump straight to the next image">Autoscroll</button>
         <div class="nav-row">
             <button class="btn-nav" onclick="navigate(-1)">Previous</button>
             <button class="btn-nav" onclick="navigate(1)">Next</button>
@@ -1371,6 +1372,7 @@ APP_TEMPLATE = """
     let compareData = null;
     let importParsedData = null;
     let shuffleMode = false;
+    let autoscrollMode = false;
     let currentAssignment = null;
     let showAssignedOnly = false;
     let maskPassIds = null; // null = no mask active; Set<string> = IDs passing the mask expr
@@ -1568,6 +1570,9 @@ APP_TEMPLATE = """
         document.getElementById('btn-shuffle').style.display = 'block';
         document.getElementById('btn-shuffle').textContent = 'Shuffle';
         document.getElementById('btn-shuffle').classList.remove('active');
+        // Autoscroll is a workflow preference, so it survives folder switches
+        document.getElementById('btn-autoscroll').style.display = 'block';
+        renderAutoscrollBtn();
         document.getElementById('assignment-notice').style.display = 'none';
         document.getElementById('show-assigned-only').checked = false;
         // Fetch folder-specific categories (may override defaults), then images/catalog/assignment
@@ -2478,6 +2483,19 @@ APP_TEMPLATE = """
         applyAllFilters(true);
     }
 
+    // --- Autoscroll ---
+
+    function renderAutoscrollBtn() {
+        const btn = document.getElementById('btn-autoscroll');
+        btn.classList.toggle('active', autoscrollMode);
+        btn.textContent = autoscrollMode ? 'Autoscroll: On' : 'Autoscroll';
+    }
+
+    function toggleAutoscroll() {
+        autoscrollMode = !autoscrollMode;
+        renderAutoscrollBtn();
+    }
+
     // --- Assignments ---
 
     async function fetchMyAssignment() {
@@ -2719,6 +2737,10 @@ APP_TEMPLATE = """
     async function selectCategory(cat) {
         highlightCategory(cat);
         await saveCurrentState();
+        // Autoscroll: once classified, advance to the next image (stop at the end)
+        if (autoscrollMode && currentIndex >= 0 && currentIndex < images.length - 1) {
+            loadStateForImage(currentIndex + 1);
+        }
     }
 
     async function navigate(dir) {
