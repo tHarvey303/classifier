@@ -321,6 +321,25 @@ class HiddenFolder(db.Model):
     hidden_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
+class Tag(db.Model):
+    """A user-defined label, shared by all users, for ad hoc grouping of images."""
+    __tablename__ = 'tags'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+    color = db.Column(db.String(20), nullable=False, default='#6b7280')
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class ImageTag(db.Model):
+    """Membership of an image in a tag: one row per (tag, image); user_id records who added it."""
+    __tablename__ = 'image_tags'
+    id = db.Column(db.Integer, primary_key=True)
+    tag_id = db.Column(db.Integer, db.ForeignKey('tags.id', ondelete='CASCADE'), nullable=False)
+    image_key = db.Column(db.String(500), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    __table_args__ = (db.UniqueConstraint('tag_id', 'image_key', name='_tag_image_uc'),)
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -873,6 +892,26 @@ APP_TEMPLATE = """
         .btn-secondary { width: 100%; padding: 8px; background: #e5e7eb; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer; margin-bottom: 10px; font-weight: 600; font-size: 0.9rem; }
         .btn-secondary:hover { background: #d1d5db; }
         .btn-secondary.active { background: #fef3c7; border-color: #f59e0b; color: #92400e; }
+        /* Tags */
+        .tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 0.5rem; min-height: 28px; }
+        .tag-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px; border: 1px solid; font-size: 0.8rem; cursor: pointer; background: white; user-select: none; line-height: 1.2; transition: background 0.15s, color 0.15s; }
+        .tag-chip:hover { filter: brightness(0.93); }
+        .tag-chip.active { color: white; }
+        .tag-chip.disabled { cursor: default; opacity: 0.7; }
+        .tag-chip.disabled:hover { filter: none; }
+        .tag-chip .tag-count { opacity: 0.7; font-size: 0.72rem; }
+        .tag-chip .tag-icon { margin-left: 2px; padding: 0 3px; border-radius: 3px; font-size: 0.85rem; opacity: 0.75; }
+        .tag-chip .tag-icon:hover { opacity: 1; background: rgba(0,0,0,0.15); }
+        .tag-empty { color: var(--text-sub); font-size: 0.82rem; font-style: italic; }
+        .tag-new-row { display: flex; gap: 6px; margin-bottom: 1rem; }
+        .tag-new-row input { flex: 1; min-width: 0; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.85rem; }
+        .tag-new-row button { padding: 6px 12px; background: #e5e7eb; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem; white-space: nowrap; }
+        .tag-new-row button:hover { background: #d1d5db; }
+        .tag-manage-box { background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 8px 10px; margin-bottom: 1rem; font-size: 0.82rem; color: #92400e; display: none; }
+        .tag-manage-box .row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+        .tag-manage-box select { flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.82rem; background: white; }
+        .tag-manage-box button { padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 6px; background: white; cursor: pointer; font-size: 0.8rem; font-weight: 600; color: #374151; white-space: nowrap; }
+        .tag-manage-box button:hover { background: #f3f4f6; }
         
         .stats-box { background: #f3f4f6; padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 0.9em; display: none; border: 1px solid #e5e7eb; }
         .stat-row { display: flex; justify-content: space-between; margin-bottom: 4px; padding-bottom: 4px; border-bottom: 1px dashed #d1d5db; }
@@ -1055,6 +1094,9 @@ APP_TEMPLATE = """
                 <option value="Agree">Unanimous Agreement</option>
             </optgroup>
             <optgroup label="By Category" id="filter-group-categories"></optgroup>
+            <optgroup label="By Tag" id="filter-group-tags">
+                <option value="Untagged">No tags</option>
+            </optgroup>
         </select>
 
         <label class="section-label">Filter by User</label>
@@ -1125,6 +1167,26 @@ APP_TEMPLATE = """
         <button id="btn-stats" class="btn-secondary" onclick="toggleStats()">Show Community Stats</button>
         <div id="stats-box" class="stats-box">
             <div id="stats-content">Loading...</div>
+        </div>
+
+        <!-- Tags: shared, user-defined groupings; click a chip to toggle it on the current image -->
+        <label class="section-label" style="display:flex; justify-content:space-between; align-items:baseline;">
+            <span>Tags <span style="font-weight:400; color:var(--text-sub); font-size:0.78rem;">(shared)</span></span>
+            <span id="tag-manage-toggle" onclick="toggleTagManage()" style="font-size:0.78rem; font-weight:500; color:var(--accent); cursor:pointer;">Manage</span>
+        </label>
+        <div id="tag-row" class="tag-row"><span class="tag-empty">No tags defined yet</span></div>
+        <div class="tag-new-row">
+            <input type="text" id="tag-new-input" placeholder="New tag&#8230; (Enter also applies it)" maxlength="100"
+                onkeydown="if(event.key==='Enter') createTag()">
+            <button onclick="createTag()">+ Add</button>
+        </div>
+        <div id="tag-manage-box" class="tag-manage-box">
+            <div>Click <b>&#8595;</b> on a tag to export it as CSV, <b>&#10005;</b> to delete it (creator or admin only). Bulk-apply to the <b id="tag-bulk-count">0</b> images currently shown:</div>
+            <div class="row">
+                <select id="tag-bulk-select"></select>
+                <button onclick="bulkTag('add')" title="Add the selected tag to every image in the current filtered list">Tag all</button>
+                <button onclick="bulkTag('remove')" title="Remove the selected tag from every image in the current filtered list">Untag all</button>
+            </div>
         </div>
 
         <label class="section-label">Notes</label>
@@ -1381,6 +1443,9 @@ APP_TEMPLATE = """
     let decCol = null;
     let skyPlotBuilt = false;
     let lfData = null; // last /api/catalog/vmax response
+    let allTags = []; // [{id, name, color, count, total, can_delete}] shared across users and folders
+    let currentImageTags = new Map(); // tag id → {username, ...} for the current image
+    let tagManageMode = false;
 
     function getCatColor(cat) { return catColors[cat] || '#6b7280'; }
 
@@ -1422,8 +1487,8 @@ APP_TEMPLATE = """
         // 1. Load Config (Categories)
         await loadCategories(null);
 
-        // 2. Fetch Folders and Users
-        await Promise.all([fetchFolders(), fetchUsers()]);
+        // 2. Fetch Folders, Users and Tags
+        await Promise.all([fetchFolders(), fetchUsers(), fetchTags()]);
 
         // 3. Setup Shortcuts
         document.addEventListener('keydown', (e) => {
@@ -1553,6 +1618,7 @@ APP_TEMPLATE = """
         showAssignedOnly = false;
         shuffleMode = false;
         maskPassIds = null;
+        currentImageTags = new Map();
         document.getElementById('mask-expr-input').value = '';
         document.getElementById('mask-expr-status').textContent = '';
         document.getElementById('mask-expr-status').className = 'mask-expr-status';
@@ -1577,7 +1643,7 @@ APP_TEMPLATE = """
         document.getElementById('show-assigned-only').checked = false;
         // Fetch folder-specific categories (may override defaults), then images/catalog/assignment
         await loadCategories(currentFolder);
-        await Promise.all([fetchImages(), fetchCatalog(), fetchMyAssignment()]);
+        await Promise.all([fetchImages(), fetchCatalog(), fetchMyAssignment(), fetchTags()]);
         document.getElementById('catalog-loading').style.display = 'none';
     }
 
@@ -1772,6 +1838,7 @@ APP_TEMPLATE = """
         }
 
         images = result;
+        document.getElementById('tag-bulk-count').textContent = images.length;
 
         if (images.length > 0) {
             // Stay on the current image if it survived the filter; otherwise go to 0
@@ -1784,6 +1851,8 @@ APP_TEMPLATE = """
             currentIndex = -1;
             document.getElementById('notes-input').value = '';
             document.getElementById('catalog-props-box').style.display = 'none';
+            currentImageTags = new Map();
+            renderTagChips();
             if (showStats) document.getElementById('stats-content').innerHTML = '';
         }
     }
@@ -1862,6 +1931,233 @@ APP_TEMPLATE = """
             content.appendChild(div);
         }
         box.style.display = 'block';
+    }
+
+    // --- Tags (shared, user-defined groupings) ---
+
+    function showToast(msg, ms = 1500) {
+        const t = document.getElementById('toast');
+        t.textContent = msg;
+        t.style.opacity = '1';
+        setTimeout(() => {
+            t.style.opacity = '0';
+            setTimeout(() => { t.textContent = 'Saved'; }, 300);
+        }, ms);
+    }
+
+    async function fetchTags() {
+        try {
+            const url = currentFolder ? `/api/tags?folder=${encodeURIComponent(currentFolder)}` : '/api/tags';
+            const res = await fetch(url);
+            const data = await res.json();
+            allTags = data.tags || [];
+        } catch(e) {
+            console.error('Error fetching tags:', e);
+            allTags = [];
+        }
+        renderTagFilterOptions();
+        renderTagChips();
+    }
+
+    function renderTagFilterOptions() {
+        // "By Tag" optgroup in the status filter, with per-folder counts
+        const sel = document.getElementById('filter-select');
+        const group = document.getElementById('filter-group-tags');
+        const prev = sel.value;
+        group.innerHTML = '';
+        const none = document.createElement('option');
+        none.value = 'Untagged';
+        none.textContent = 'No tags';
+        group.appendChild(none);
+        allTags.forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = `tag:${t.id}`;
+            opt.textContent = `${t.name} (${t.count})`;
+            group.appendChild(opt);
+        });
+        sel.value = [...sel.options].some(o => o.value === prev) ? prev : 'All';
+
+        // Bulk-apply dropdown in the manage box
+        const bulk = document.getElementById('tag-bulk-select');
+        const prevBulk = bulk.value;
+        bulk.innerHTML = '';
+        allTags.forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = t.id;
+            opt.textContent = t.name;
+            bulk.appendChild(opt);
+        });
+        if ([...bulk.options].some(o => o.value === prevBulk)) bulk.value = prevBulk;
+    }
+
+    function renderTagChips() {
+        const row = document.getElementById('tag-row');
+        row.innerHTML = '';
+        if (allTags.length === 0) {
+            row.innerHTML = '<span class="tag-empty">No tags defined yet</span>';
+            return;
+        }
+        const hasImage = currentIndex >= 0 && currentIndex < images.length;
+        allTags.forEach(t => {
+            const info = currentImageTags.get(t.id);
+            const active = !!info;
+            const chip = document.createElement('span');
+            chip.className = 'tag-chip' + (active ? ' active' : '') + (hasImage ? '' : ' disabled');
+            chip.style.borderColor = t.color;
+            chip.style.color = active ? 'white' : t.color;
+            chip.style.background = active ? t.color : 'white';
+            chip.title = active
+                ? `Added by ${info.username || 'unknown'} — click to remove`
+                : (hasImage ? 'Click to add this tag' : `${t.total} image(s) tagged overall`);
+            const name = document.createElement('span');
+            name.textContent = t.name;
+            chip.appendChild(name);
+            const cnt = document.createElement('span');
+            cnt.className = 'tag-count';
+            cnt.textContent = t.count;
+            cnt.title = `${t.count} in this folder`;
+            chip.appendChild(cnt);
+            if (hasImage) chip.onclick = () => toggleTag(t.id);
+            if (tagManageMode) {
+                const exp = document.createElement('span');
+                exp.className = 'tag-icon';
+                exp.innerHTML = '&#8595;';
+                exp.title = `Export "${t.name}" (this folder) as CSV`;
+                exp.onclick = (e) => { e.stopPropagation(); exportTag(t.id); };
+                chip.appendChild(exp);
+                if (t.can_delete) {
+                    const x = document.createElement('span');
+                    x.className = 'tag-icon';
+                    x.innerHTML = '&#10005;';
+                    x.title = `Delete tag "${t.name}"`;
+                    x.onclick = (e) => { e.stopPropagation(); deleteTag(t.id); };
+                    chip.appendChild(x);
+                }
+            }
+            row.appendChild(chip);
+        });
+    }
+
+    async function fetchImageTags(key) {
+        try {
+            const res = await fetch(`/api/image_tags?key=${encodeURIComponent(key)}`);
+            const data = await res.json();
+            // Discard if the user has already moved to another image
+            if (currentIndex < 0 || images[currentIndex] !== key) return;
+            currentImageTags = new Map((data.tags || []).map(t => [t.id, t]));
+        } catch(e) {
+            console.error('Error fetching image tags:', e);
+            currentImageTags = new Map();
+        }
+        renderTagChips();
+    }
+
+    async function toggleTag(tagId) {
+        if (currentIndex < 0 || currentIndex >= images.length) return;
+        const key = images[currentIndex];
+        const action = currentImageTags.has(tagId) ? 'remove' : 'add';
+        try {
+            const res = await fetch(`/api/image_tags/${action}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ tag_id: tagId, keys: [key] })
+            });
+            const data = await res.json();
+            if (!res.ok) { alert(data.error || 'Failed to update tag'); return; }
+            if (currentIndex < 0 || images[currentIndex] !== key) return; // navigated away meanwhile
+            const tag = allTags.find(t => t.id === tagId);
+            if (action === 'add') {
+                currentImageTags.set(tagId, { id: tagId, username: data.username });
+                if (tag && data.changed) tag.count += 1;
+            } else {
+                currentImageTags.delete(tagId);
+                if (tag && data.changed) tag.count = Math.max(0, tag.count - 1);
+            }
+            renderTagChips();
+            renderTagFilterOptions();
+        } catch(e) {
+            console.error('Error toggling tag:', e);
+        }
+    }
+
+    async function createTag() {
+        const input = document.getElementById('tag-new-input');
+        const name = input.value.trim();
+        if (!name) return;
+        try {
+            const res = await fetch('/api/tags', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, folder: currentFolder })
+            });
+            const data = await res.json();
+            if (!res.ok) { alert(data.error || 'Could not create tag'); return; }
+            input.value = '';
+            // Refetch rather than patch locally: picks up tags other users created or deleted meanwhile
+            await fetchTags();
+            // Typing a tag while viewing an image almost always means "tag this one", so apply it
+            if (currentIndex >= 0 && currentIndex < images.length && !currentImageTags.has(data.tag.id)) {
+                await toggleTag(data.tag.id);
+            }
+        } catch(e) {
+            console.error('Error creating tag:', e);
+        }
+    }
+
+    async function deleteTag(tagId) {
+        const tag = allTags.find(t => t.id === tagId);
+        if (!tag) return;
+        if (!confirm(`Delete tag "${tag.name}"? It will be removed from all ${tag.total} tagged image(s), in every folder.`)) return;
+        try {
+            const res = await fetch(`/api/tags/${tagId}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (!res.ok) { alert(data.error || 'Could not delete tag'); return; }
+            allTags = allTags.filter(t => t.id !== tagId);
+            currentImageTags.delete(tagId);
+            const wasFiltering = document.getElementById('filter-select').value === `tag:${tagId}`;
+            renderTagFilterOptions();
+            renderTagChips();
+            if (wasFiltering) fetchImages(); // filter fell back to "All"
+        } catch(e) {
+            console.error('Error deleting tag:', e);
+        }
+    }
+
+    function toggleTagManage() {
+        tagManageMode = !tagManageMode;
+        document.getElementById('tag-manage-box').style.display = tagManageMode ? 'block' : 'none';
+        document.getElementById('tag-manage-toggle').textContent = tagManageMode ? 'Done' : 'Manage';
+        document.getElementById('tag-bulk-count').textContent = images.length;
+        renderTagChips();
+    }
+
+    async function bulkTag(action) {
+        const tagId = parseInt(document.getElementById('tag-bulk-select').value);
+        const tag = allTags.find(t => t.id === tagId);
+        if (!tag) { alert('No tag selected'); return; }
+        if (images.length === 0) return;
+        const verb = action === 'add' ? 'Add' : 'Remove';
+        const prep = action === 'add' ? 'to' : 'from';
+        if (!confirm(`${verb} tag "${tag.name}" ${prep} all ${images.length} images currently shown?`)) return;
+        try {
+            const res = await fetch(`/api/image_tags/${action}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ tag_id: tagId, keys: images })
+            });
+            const data = await res.json();
+            if (!res.ok) { alert(data.error || 'Bulk tag failed'); return; }
+            showToast(`${action === 'add' ? 'Tagged' : 'Untagged'} ${data.changed} image(s)`);
+            await fetchTags();
+            if (currentIndex >= 0 && currentIndex < images.length) fetchImageTags(images[currentIndex]);
+        } catch(e) {
+            console.error('Error bulk tagging:', e);
+        }
+    }
+
+    function exportTag(tagId) {
+        if (!currentFolder) { alert('Select a folder first'); return; }
+        window.location.href = `/api/tags/${tagId}/export?folder=${encodeURIComponent(currentFolder)}`;
     }
 
     // --- Scatter Plot ---
@@ -2687,6 +2983,9 @@ APP_TEMPLATE = """
         document.getElementById('notes-input').value = userData.notes || '';
         highlightCategory(userData.category);
 
+        // Tags on this image (not awaited; stale responses are discarded)
+        fetchImageTags(key);
+
         // Show catalog properties for this image
         updateCatalogProps(key);
 
@@ -3108,6 +3407,11 @@ def folder_hidden_for_current_user(folder: str) -> bool:
     return HiddenFolder.query.filter_by(folder=folder).first() is not None
 
 
+def folder_key_condition(column, folder: str):
+    """SQL condition matching image keys that live in *folder* (either bucket layout)."""
+    return db.or_(column.like(f"classifier/{folder}/%"), column.like(f"{folder}/%"))
+
+
 def list_all_image_keys(prefix: str) -> List[str]:
     """Paginate through all R2 objects under *prefix* and return image keys."""
     keys: List[str] = []
@@ -3175,6 +3479,20 @@ def get_images():
             logger.error(f"Error computing no-votes filter: {e}", exc_info=True)
             filtered = []
         return jsonify(filtered)
+
+    # Tag filters (tags are shared across users)
+    if filter_val == 'Untagged' or filter_val.startswith('tag:'):
+        try:
+            q = ImageTag.query.filter(folder_key_condition(ImageTag.image_key, folder))
+            if filter_val.startswith('tag:'):
+                q = q.filter(ImageTag.tag_id == int(filter_val[4:]))
+            tagged_keys = {r.image_key for r in q.with_entities(ImageTag.image_key).distinct().all()}
+        except Exception as e:
+            logger.error(f"Error computing tag filter: {e}", exc_info=True)
+            tagged_keys = set()
+        if filter_val == 'Untagged':
+            return jsonify([key for key in all_keys if key not in tagged_keys])
+        return jsonify([key for key in all_keys if key in tagged_keys])
 
     if filter_val in ('Agree', 'Disagree'):
         try:
@@ -3271,6 +3589,238 @@ def get_classifications():
         return jsonify({})
 
 
+# --- Tags (shared, user-defined image groupings) ---
+
+TAG_PALETTE = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899',
+               '#06b6d4', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#a855f7']
+
+
+def tag_counts(folder: Optional[str]) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """Return ({tag_id: images tagged in folder}, {tag_id: images tagged anywhere})."""
+    total_rows = db.session.query(ImageTag.tag_id, db.func.count(ImageTag.id)) \
+        .group_by(ImageTag.tag_id).all()
+    total = {tid: n for tid, n in total_rows}
+    if not folder:
+        return dict(total), total
+    folder_rows = db.session.query(ImageTag.tag_id, db.func.count(ImageTag.id)) \
+        .filter(folder_key_condition(ImageTag.image_key, folder)) \
+        .group_by(ImageTag.tag_id).all()
+    return {tid: n for tid, n in folder_rows}, total
+
+
+def serialize_tag(tag: 'Tag', folder_counts: Dict[int, int], total_counts: Dict[int, int]) -> Dict:
+    return {
+        'id': tag.id,
+        'name': tag.name,
+        'color': tag.color,
+        'created_by': tag.created_by,
+        'count': folder_counts.get(tag.id, 0),
+        'total': total_counts.get(tag.id, 0),
+        'can_delete': bool(current_user.is_admin or tag.created_by == current_user.id),
+    }
+
+
+@app.route('/api/tags')
+@login_required
+def list_tags():
+    """All defined tags, with usage counts for the given folder and overall."""
+    folder = request.args.get('folder') or None
+    try:
+        tags = Tag.query.order_by(db.func.lower(Tag.name)).all()
+        folder_counts, total_counts = tag_counts(folder)
+        return jsonify({'tags': [serialize_tag(t, folder_counts, total_counts) for t in tags]})
+    except Exception as e:
+        logger.error(f"Error listing tags: {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+
+@app.route('/api/tags', methods=['POST'])
+@login_required
+def create_tag():
+    """Create a tag (any user). Names are unique case-insensitively; an existing match is returned as-is."""
+    data = request.json or {}
+    name = ' '.join(str(data.get('name', '')).split())  # trim + collapse whitespace
+    folder = data.get('folder') or None
+    if not name:
+        return jsonify({'error': 'Tag name is required'}), 400
+    if len(name) > 100:
+        return jsonify({'error': 'Tag name must be 100 characters or fewer'}), 400
+    try:
+        tag = Tag.query.filter(db.func.lower(Tag.name) == name.lower()).first()
+        created = False
+        if not tag:
+            # Least-used palette colour keeps tags visually distinct
+            used = [t.color for t in Tag.query.all()]
+            color = min(TAG_PALETTE, key=lambda c: (used.count(c), TAG_PALETTE.index(c)))
+            tag = Tag(name=name, color=color, created_by=current_user.id)
+            db.session.add(tag)
+            db.session.commit()
+            created = True
+        folder_counts, total_counts = tag_counts(folder)
+        return jsonify({'tag': serialize_tag(tag, folder_counts, total_counts), 'created': created}), \
+            (201 if created else 200)
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error creating tag '{name}': {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+
+@app.route('/api/tags/<int:tag_id>', methods=['DELETE'])
+@login_required
+def delete_tag(tag_id):
+    """Delete a tag and all of its image memberships. Allowed for the creator or an admin."""
+    tag = Tag.query.get(tag_id)
+    if not tag:
+        return jsonify({'error': 'Tag not found'}), 404
+    if not (current_user.is_admin or tag.created_by == current_user.id):
+        return jsonify({'error': 'Only the tag creator or an admin can delete this tag'}), 403
+    try:
+        # Explicit delete: SQLite ignores ON DELETE CASCADE unless foreign_keys is enabled
+        removed = ImageTag.query.filter_by(tag_id=tag_id).delete(synchronize_session=False)
+        db.session.delete(tag)
+        db.session.commit()
+        return jsonify({'status': 'success', 'removed': removed})
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error deleting tag {tag_id}: {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+
+@app.route('/api/image_tags')
+@login_required
+def get_image_tags():
+    """Tags applied to a single image, with who applied each."""
+    key = request.args.get('key')
+    if not key:
+        return jsonify({'error': 'No key provided'}), 400
+    try:
+        rows = db.session.query(ImageTag, Tag, User.username) \
+            .join(Tag, ImageTag.tag_id == Tag.id) \
+            .outerjoin(User, ImageTag.user_id == User.id) \
+            .filter(ImageTag.image_key == key) \
+            .order_by(db.func.lower(Tag.name)).all()
+        return jsonify({'tags': [
+            {'id': t.id, 'name': t.name, 'color': t.color, 'username': username,
+             'created_at': it.created_at.isoformat() if it.created_at else None}
+            for it, t, username in rows
+        ]})
+    except Exception as e:
+        logger.error(f"Error fetching tags for key {key}: {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+
+def _parse_image_tag_request():
+    """Shared parsing for add/remove. Returns (tag, keys, error) where error is (payload, status) or None."""
+    data = request.json or {}
+    keys = data.get('keys')
+    if keys is None and data.get('key'):
+        keys = [data['key']]
+    keys = list(dict.fromkeys(k for k in (keys or []) if isinstance(k, str) and k))
+    try:
+        tag_id = int(data.get('tag_id'))
+    except (TypeError, ValueError):
+        return None, [], ({'error': 'tag_id is required'}, 400)
+    tag = Tag.query.get(tag_id)
+    if not tag:
+        return None, [], ({'error': 'Tag not found'}, 404)
+    if not keys:
+        return tag, [], ({'error': 'No image keys provided'}, 400)
+    return tag, keys, None
+
+
+@app.route('/api/image_tags/add', methods=['POST'])
+@login_required
+def add_image_tags():
+    """Apply a tag to one or more images. Any user may add; images already carrying the tag are skipped."""
+    tag, keys, err = _parse_image_tag_request()
+    if err:
+        return jsonify(err[0]), err[1]
+    try:
+        existing = {r.image_key for r in ImageTag.query.filter_by(tag_id=tag.id)
+                    .with_entities(ImageTag.image_key).all()}
+        new_keys = [k for k in keys if k not in existing]
+        for k in new_keys:
+            db.session.add(ImageTag(tag_id=tag.id, image_key=k, user_id=current_user.id))
+        db.session.commit()
+        return jsonify({'status': 'success', 'changed': len(new_keys), 'username': current_user.username})
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error adding tag {tag.id} to {len(keys)} image(s): {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+
+@app.route('/api/image_tags/remove', methods=['POST'])
+@login_required
+def remove_image_tags():
+    """Remove a tag from one or more images. Any user may remove: tags are shared, ad hoc groupings."""
+    tag, keys, err = _parse_image_tag_request()
+    if err:
+        return jsonify(err[0]), err[1]
+    try:
+        removed = 0
+        # Chunk the IN clause to stay under SQLite's bound-parameter limit
+        for i in range(0, len(keys), 500):
+            removed += ImageTag.query.filter(
+                ImageTag.tag_id == tag.id, ImageTag.image_key.in_(keys[i:i + 500])
+            ).delete(synchronize_session=False)
+        db.session.commit()
+        return jsonify({'status': 'success', 'changed': removed})
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error removing tag {tag.id} from {len(keys)} image(s): {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+
+@app.route('/api/tags/<int:tag_id>/export')
+@login_required
+def export_tag(tag_id):
+    """CSV of every image in a folder carrying this tag, joined with catalog columns when available."""
+    import csv as csv_mod
+    folder = request.args.get('folder')
+    tag = Tag.query.get(tag_id)
+    if not tag:
+        return jsonify({'error': 'Tag not found'}), 404
+    if not folder:
+        return jsonify({'error': 'No folder specified'}), 400
+    if folder_hidden_for_current_user(folder):
+        abort(403)
+    try:
+        members = db.session.query(ImageTag, User.username) \
+            .outerjoin(User, ImageTag.user_id == User.id) \
+            .filter(ImageTag.tag_id == tag_id, folder_key_condition(ImageTag.image_key, folder)) \
+            .order_by(ImageTag.image_key).all()
+    except Exception as e:
+        logger.error(f"Tag export DB error: {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+    catalog = load_catalog_for_folder(folder)
+    cat_cols = [c for c in catalog['columns'] if c != 'ID'] if catalog else []
+    base_cols = ['ID', 'image_key', 'tag', 'tagged_by', 'tagged_at']
+    rows = []
+    for it, username in members:
+        stem = os.path.splitext(it.image_key.split('/')[-1])[0]
+        row: Dict = {'ID': stem, 'image_key': it.image_key, 'tag': tag.name,
+                     'tagged_by': username or '',
+                     'tagged_at': it.created_at.isoformat() if it.created_at else ''}
+        if catalog:
+            cat_row = catalog['rows'].get(stem, {})
+            for col in cat_cols:
+                val = cat_row.get(col)
+                row[col] = '' if val is None else val
+        rows.append(row)
+
+    buf = io.StringIO()
+    writer = csv_mod.DictWriter(buf, fieldnames=base_cols + cat_cols)
+    writer.writeheader()
+    writer.writerows(rows)
+    safe_folder = folder.replace('/', '_')
+    safe_tag = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in tag.name)
+    return app.response_class(
+        buf.getvalue(), mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename="{safe_folder}_tag_{safe_tag}.csv"'}
+    )
+
+
 @app.route('/api/export')
 @login_required
 def export_classifications():
@@ -3310,6 +3860,18 @@ def export_classifications():
             user_cache[uid] = u.username if u else str(uid)
         return user_cache[uid]
 
+    # Tag names per image (shared across users), joined with ';' in the export
+    tag_map: Dict[str, List[str]] = {}
+    try:
+        tag_rows = db.session.query(ImageTag.image_key, Tag.name) \
+            .join(Tag, ImageTag.tag_id == Tag.id) \
+            .filter(folder_key_condition(ImageTag.image_key, folder)) \
+            .order_by(db.func.lower(Tag.name)).all()
+        for image_key, tag_name in tag_rows:
+            tag_map.setdefault(image_key, []).append(tag_name)
+    except Exception as e:
+        logger.error(f"Export tag lookup error: {e}", exc_info=True)
+
     # Build row dicts
     rows = []
     for r in records:
@@ -3321,6 +3883,7 @@ def export_classifications():
         row['image_key'] = r.image_key
         row['category'] = r.category or ''
         row['notes'] = (r.notes or '').replace('\n', ' ')
+        row['tags'] = ';'.join(tag_map.get(r.image_key, []))
         row['timestamp'] = r.timestamp.isoformat() if r.timestamp else ''
         if catalog:
             cat_row = catalog['rows'].get(stem, {})
@@ -3507,6 +4070,16 @@ def db_backup():
                         'timestamp': c.timestamp.isoformat() if c.timestamp else None,
                     }
                     for c in classifications
+                ],
+                'tags': [
+                    {'id': t.id, 'name': t.name, 'color': t.color, 'created_by': t.created_by,
+                     'created_at': t.created_at.isoformat() if t.created_at else None}
+                    for t in Tag.query.order_by(Tag.id).all()
+                ],
+                'image_tags': [
+                    {'id': it.id, 'tag_id': it.tag_id, 'image_key': it.image_key, 'user_id': it.user_id,
+                     'created_at': it.created_at.isoformat() if it.created_at else None}
+                    for it in ImageTag.query.order_by(ImageTag.id).all()
                 ],
             }
         }

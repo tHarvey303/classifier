@@ -10,6 +10,7 @@ It is a single-file Flask app backed by Postgres (or SQLite) for classifications
 - **Fully keyboard-drivable** classification UI with configurable categories and free-text notes
 - **Folder-based datasets**: each prefix in your bucket becomes a selectable dataset, with per-folder category overrides
 - **Optional FITS catalog integration**: show catalog metadata next to each image, filter with NumPy-style expressions (e.g. `log10(mass) > 9 & z < 2`)
+- **Shared tags**: any user can define tags (e.g. `lensed`, `check-with-supervisor`) and apply them to images; everyone can filter by tag, bulk-tag the current filtered set, and export a tag's members as CSV — handy for ad hoc grouping outside the fixed category scheme
 - **Admin dashboard**: manage users, hide folders, assign index ranges to users, or auto-split a folder across the team with configurable overlap for inter-rater calibration
 - **Team dashboard**: per-folder progress, per-user counts, category breakdowns, and agreement rates
 - **Export & backup**: CSV export of classifications, bulk import, user-vs-user comparison, and DB backup endpoints
@@ -171,7 +172,8 @@ or use the in-app `/api/db_backup` / CSV export endpoints (admin only).
 2. **Images** — render whatever your "source" is (cutout, spectrum, light curve, photo…) to PNG/JPEG and upload one file per object.
 3. **Metadata** — optional: build a `catalog.fits` with an `ID` column matching your filenames plus whatever columns help classifiers decide. The filter box accepts expressions like `snr > 5 & log10(flux) < -18`.
 4. **Team workflow** — as admin, use *Assignments* to give each person an index range, or *Auto-split* to divide a folder with N% overlap so you can measure inter-classifier agreement on the dashboard.
-5. **Results** — export per-folder CSVs from the app, or query the `classification` table directly (`user_id`, `image_key`, `category`, `notes`, `timestamp`).
+5. **Results** — export per-folder CSVs from the app (the `tags` column lists any shared tags on each image), or query the `classification` table directly (`user_id`, `image_key`, `category`, `notes`, `timestamp`). Tag memberships live in `tags` / `image_tags`.
+6. **Ad hoc groups** — use the *Tags* box in the sidebar: type a name and press Enter to create a tag and apply it to the current image, click chips to toggle, and pick a tag under *Filter Status → By Tag* to browse the group. *Manage* reveals bulk tag/untag of everything currently shown, per-tag CSV export, and delete (creator or admin).
 
 ## Repository layout
 
