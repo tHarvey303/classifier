@@ -1447,6 +1447,81 @@ APP_TEMPLATE = """
     let currentImageTags = new Map(); // tag id → {username, ...} for the current image
     let tagManageMode = false;
 
+    // --- Prefetch: keep the neighbouring images warm so Next/Prev is instant ---
+    const PUBLIC_BASE = {{ public_base|tojson }};
+    const PREFETCH_AHEAD = 2;   // images after the current one to warm
+    const PREFETCH_BEHIND = 1;  // and one before, so stepping back is instant too
+    const IMG_CACHE_MAX = 12;   // decoded images held in memory (LRU)
+    const urlCache = new Map();  // image key -> public URL
+    const dataCache = new Map(); // image key -> {category, notes} for this user
+    const imgCache = new Map();  // image key -> Image, kept referenced so the bitmap stays decoded
+    let loadToken = 0;           // guards against out-of-order loadStateForImage responses
+
+    // Synchronous when we know the public base (the usual case); null means "ask the server".
+    function publicUrlFor(key) {
+        const cached = urlCache.get(key);
+        if (cached) return cached;
+        if (!PUBLIC_BASE) return null;
+        const url = `${PUBLIC_BASE}/${key}`;
+        urlCache.set(key, url);
+        return url;
+    }
+
+    async function resolvePublicUrl(key) {
+        const known = publicUrlFor(key);
+        if (known) return known;
+        const res = await fetch(`/api/public_url?key=${encodeURIComponent(key)}`);
+        const data = await res.json();
+        urlCache.set(key, data.url);
+        return data.url;
+    }
+
+    function prefetchImage(key) {
+        if (imgCache.has(key)) {                       // refresh its LRU position
+            const img = imgCache.get(key);
+            imgCache.delete(key);
+            imgCache.set(key, img);
+            return;
+        }
+        const start = (url) => {
+            const img = new Image();
+            img.decoding = 'async';
+            img.src = url;
+            if (img.decode) img.decode().catch(() => {});  // warm the decoded bitmap, not just the bytes
+            imgCache.set(key, img);
+            while (imgCache.size > IMG_CACHE_MAX) imgCache.delete(imgCache.keys().next().value);
+        };
+        const url = publicUrlFor(key);
+        if (url) start(url); else resolvePublicUrl(key).then(start).catch(() => {});
+    }
+
+    async function fetchUserData(key) {
+        if (dataCache.has(key)) return dataCache.get(key);
+        const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`);
+        const data = await res.json();
+        dataCache.set(key, data);
+        return data;
+    }
+
+    // Warm the images around `index`, plus their notes/category in a single round trip.
+    function prefetchAround(index) {
+        const wanted = [];
+        for (let d = 1; d <= PREFETCH_AHEAD; d++) wanted.push(index + d);
+        for (let d = 1; d <= PREFETCH_BEHIND; d++) wanted.push(index - d);
+        const keys = wanted.filter(i => i >= 0 && i < images.length).map(i => images[i]);
+        keys.forEach(prefetchImage);
+
+        const missing = keys.filter(k => !dataCache.has(k));
+        if (!missing.length) return;
+        fetch('/api/data_batch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ keys: missing })
+        }).then(r => r.json()).then(map => {
+            if (map && !map.error) Object.entries(map).forEach(([k, v]) => dataCache.set(k, v));
+        }).catch(() => {});
+    }
+
     function getCatColor(cat) { return catColors[cat] || '#6b7280'; }
 
     async function loadCategories(folder) {
@@ -1655,6 +1730,7 @@ APP_TEMPLATE = """
         if (filterUserId) url += `&filter_user_id=${encodeURIComponent(filterUserId)}`;
         const res = await fetch(url);
         serverImages = await res.json();
+        dataCache.clear();
         applyAllFilters();
     }
 
@@ -2966,19 +3042,25 @@ APP_TEMPLATE = """
         if (index < 0 || index >= images.length) return;
         currentIndex = index;
         const key = images[currentIndex];
+        const token = ++loadToken;
         
         const displayname = key.split('/').pop(); 
         document.getElementById('filename-display').innerText = displayname;
         document.getElementById('counter-display').innerText = `${index + 1} / ${images.length}`;
 
-        // Get Public URL
-        const urlRes = await fetch(`/api/public_url?key=${encodeURIComponent(key)}`);
-        const urlData = await urlRes.json();
-        document.getElementById('main-image').src = urlData.url;
+        // Public URL: known locally, so the (prefetched) image swaps in with no round trip
+        const knownUrl = publicUrlFor(key);
+        if (knownUrl) {
+            document.getElementById('main-image').src = knownUrl;
+        } else {
+            const url = await resolvePublicUrl(key);
+            if (token !== loadToken) return;  // navigated away meanwhile
+            document.getElementById('main-image').src = url;
+        }
 
-        // Get User Data
-        const dataRes = await fetch(`/api/data?key=${encodeURIComponent(key)}`);
-        const userData = await dataRes.json();
+        // User data: served from the prefetch cache when we have it
+        const userData = dataCache.has(key) ? dataCache.get(key) : await fetchUserData(key);
+        if (token !== loadToken) return;
 
         document.getElementById('notes-input').value = userData.notes || '';
         highlightCategory(userData.category);
@@ -2998,6 +3080,8 @@ APP_TEMPLATE = """
         if (showStats) {
             fetchStats();
         }
+
+        prefetchAround(index);
     }
 
     function highlightCategory(cat) {
@@ -3022,6 +3106,7 @@ APP_TEMPLATE = """
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ key, notes, category })
         });
+        dataCache.set(key, { category, notes });
         
         const t = document.getElementById('toast');
         t.style.opacity = '1';
@@ -3133,7 +3218,8 @@ def logout():
 def index():
     is_sqlite = app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite')
     return render_template_string(APP_TEMPLATE, is_sqlite=is_sqlite,
-                                   is_admin=current_user.is_admin)
+                                   is_admin=current_user.is_admin,
+                                   public_base=public_base_url())
 
 @app.route('/api/users')
 @login_required
@@ -3551,19 +3637,21 @@ def get_images():
 
     return jsonify(filtered)
 
+def public_base_url() -> str:
+    """Base URL R2 objects are served from; the client builds image URLs from it directly."""
+    base = R2_PUBLIC_DOMAIN.rstrip('/')
+    if base and not base.startswith('http'):
+        base = f"https://{base}"
+    return base
+
+
 @app.route('/api/public_url')
 @login_required
 def get_public_url():
     key = request.args.get('key')
     if not key: return jsonify({'error': 'No key'}), 400
     
-    # Construct the public URL
-    base = R2_PUBLIC_DOMAIN.rstrip('/')
-    if not base.startswith('http'):
-        base = f"https://{base}"
-        
-    url = f"{base}/{key}"
-    return jsonify({'url': url})
+    return jsonify({'url': f"{public_base_url()}/{key}"})
 
 @app.route('/api/classifications')
 @login_required
@@ -3963,6 +4051,25 @@ def get_data():
         return jsonify({'category': '', 'notes': ''})
     except Exception as e:
         logger.error(f"Error fetching data for key {key}: {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
+
+@app.route('/api/data_batch', methods=['POST'])
+@login_required
+def get_data_batch():
+    """This user's category/notes for several keys at once, for the client's prefetcher."""
+    payload = request.get_json(silent=True) or {}
+    keys = [k for k in (payload.get('keys') or []) if isinstance(k, str)][:50]
+    if not keys:
+        return jsonify({})
+    try:
+        records = Classification.query.filter(
+            Classification.user_id == current_user.id,
+            Classification.image_key.in_(keys)
+        ).all()
+        found = {r.image_key: {'category': r.category or '', 'notes': r.notes or ''} for r in records}
+        return jsonify({k: found.get(k, {'category': '', 'notes': ''}) for k in keys})
+    except Exception as e:
+        logger.error(f"Error fetching batch data: {e}", exc_info=True)
         return jsonify({'error': 'Database error'}), 500
 
 @app.route('/api/stats')
