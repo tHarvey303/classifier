@@ -55,6 +55,9 @@ R2_SECRET = os.environ.get('R2_SECRET_ACCESS_KEY')
 BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 R2_PUBLIC_DOMAIN = os.environ.get('R2_PUBLIC_DOMAIN', 'cdn.tharvey.space')
 
+# Browser-renderable image formats shown for classification
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp')
+
 if R2_ENDPOINT and not R2_ENDPOINT.startswith("http"):
     R2_ENDPOINT = f"https://{R2_ENDPOINT}"
 
@@ -3505,7 +3508,7 @@ def list_all_image_keys(prefix: str) -> List[str]:
     while True:
         resp = s3_client.list_objects_v2(**kwargs)
         for obj in resp.get('Contents', []):
-            if obj['Key'].lower().endswith(('.png', '.jpg', '.jpeg', '.fits')):
+            if obj['Key'].lower().endswith(IMAGE_EXTENSIONS + ('.fits',)):
                 keys.append(obj['Key'])
         if resp.get('IsTruncated'):
             kwargs['ContinuationToken'] = resp['NextContinuationToken']
@@ -3527,14 +3530,14 @@ def get_images():
     try:
         prefix = f"classifier/{folder}/"
         all_keys = [k for k in list_all_image_keys(prefix)
-                    if k.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                    if k.lower().endswith(IMAGE_EXTENSIONS)]
 
         # Fallback: folder at bucket root
         if not all_keys:
             logger.info(f"No contents in {prefix}, trying root prefix {folder}/")
             prefix = f"{folder}/"
             all_keys = [k for k in list_all_image_keys(prefix)
-                        if k.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                        if k.lower().endswith(IMAGE_EXTENSIONS)]
 
         all_keys.sort()
         logger.info(f"Found {len(all_keys)} images")
@@ -4354,11 +4357,11 @@ def get_my_assignment():
     try:
         prefix = f"classifier/{folder}/"
         all_keys = sorted(k for k in list_all_image_keys(prefix)
-                          if k.lower().endswith(('.png', '.jpg', '.jpeg')))
+                          if k.lower().endswith(IMAGE_EXTENSIONS))
         if not all_keys:
             prefix = f"{folder}/"
             all_keys = sorted(k for k in list_all_image_keys(prefix)
-                              if k.lower().endswith(('.png', '.jpg', '.jpeg')))
+                              if k.lower().endswith(IMAGE_EXTENSIONS))
         assigned = all_keys[assignment.start_index:assignment.end_index + 1]
     except Exception as e:
         logger.error(f"Error resolving assignment keys: {e}", exc_info=True)
@@ -4477,10 +4480,10 @@ def bulk_import_preview():
     # List images currently in the folder
     try:
         prefix = f"classifier/{folder}/"
-        all_keys = [k for k in list_all_image_keys(prefix) if k.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        all_keys = [k for k in list_all_image_keys(prefix) if k.lower().endswith(IMAGE_EXTENSIONS)]
         if not all_keys:
             prefix = f"{folder}/"
-            all_keys = [k for k in list_all_image_keys(prefix) if k.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            all_keys = [k for k in list_all_image_keys(prefix) if k.lower().endswith(IMAGE_EXTENSIONS)]
     except Exception as e:
         return jsonify({'error': f'Failed to list images in folder: {e}'}), 500
 

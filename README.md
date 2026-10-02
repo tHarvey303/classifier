@@ -41,7 +41,7 @@ your-bucket/
         └── ...
 ```
 
-- Supported image formats: `.png`, `.jpg`, `.jpeg`
+- Supported image formats: `.png`, `.jpg`, `.jpeg`, `.webp`
 - **`catalog.fits`** (optional): a FITS table with an `ID` column whose values match the image filenames without extension (e.g. `ID = 10023` ↔ `10023.png`). All other columns are shown as metadata and are available in filter expressions.
 - **`config.yaml`** (optional, per folder): overrides the global category list, e.g.
 
@@ -169,7 +169,7 @@ or use the in-app `/api/db_backup` / CSV export endpoints (admin only).
 ## 5. Adapt it to your own problem
 
 1. **Categories** — edit `config.yaml` (global default) and/or drop a `config.yaml` into each bucket folder. No code changes needed.
-2. **Images** — render whatever your "source" is (cutout, spectrum, light curve, photo…) to PNG/JPEG and upload one file per object.
+2. **Images** — render whatever your "source" is (cutout, spectrum, light curve, photo…) to PNG/JPEG/WebP and upload one file per object.
 3. **Metadata** — optional: build a `catalog.fits` with an `ID` column matching your filenames plus whatever columns help classifiers decide. The filter box accepts expressions like `snr > 5 & log10(flux) < -18`.
 4. **Team workflow** — as admin, use *Assignments* to give each person an index range, or *Auto-split* to divide a folder with N% overlap so you can measure inter-classifier agreement on the dashboard.
 5. **Results** — export per-folder CSVs from the app (the `tags` column lists any shared tags on each image), or query the `classification` table directly (`user_id`, `image_key`, `category`, `notes`, `timestamp`). Tag memberships live in `tags` / `image_tags`.
