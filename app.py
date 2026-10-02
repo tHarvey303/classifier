@@ -37,7 +37,11 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-key-please-change')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///local.db')
+_db_url = os.environ.get('DATABASE_URL', 'sqlite:///local.db')
+# SQLAlchemy >= 2.1 maps bare postgresql:// to psycopg (v3); we ship psycopg2
+if _db_url.startswith(('postgresql://', 'postgres://')):
+    _db_url = 'postgresql+psycopg2://' + _db_url.split('://', 1)[1]
+app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'pool_pre_ping': True}
 
