@@ -1437,7 +1437,9 @@ APP_TEMPLATE = """
     let currentFolder = "";
     let showStats = false;
     let catalogData = null; // null = not loaded yet; false = unavailable; object = loaded
-    let classificationMap = {}; // image_key → category, fetched per folder
+    let classificationMap = {}; // keyStem(image_key) → category, fetched per folder
+    // Image key without extension, so classifications saved on x.png match x.webp
+    const keyStem = key => key.replace(/\\.[^./]+$/, '');
     let compareData = null;
     let importParsedData = null;
     let shuffleMode = false;
@@ -2249,7 +2251,9 @@ APP_TEMPLATE = """
         if (!currentFolder) return;
         try {
             const res = await fetch(`/api/classifications?folder=${encodeURIComponent(currentFolder)}`);
-            classificationMap = await res.json();
+            const byKey = await res.json();
+            classificationMap = {};
+            for (const [k, cat] of Object.entries(byKey)) classificationMap[keyStem(k)] = cat;
         } catch(e) {
             console.error('Error fetching classifications:', e);
         }
@@ -2314,7 +2318,7 @@ APP_TEMPLATE = """
             const wantCat = parent.slice('_class:'.length);
             restrictIds = Object.keys(classificationMap)
                 .filter(k => classificationMap[k] === wantCat)
-                .map(getImageId);
+                .map(k => k.split('/').pop());
         }
 
         const payload = {
@@ -2747,7 +2751,7 @@ APP_TEMPLATE = """
             if (!row) return;
             const x = row[xCol], y = row[yCol];
             if (x === null || x === undefined || y === null || y === undefined) return;
-            points.push({ key, x, y, cat: classificationMap[key] || 'Unclassified', row });
+            points.push({ key, x, y, cat: classificationMap[keyStem(key)] || 'Unclassified', row });
         });
 
         const currentKey = currentIndex >= 0 && currentIndex < images.length ? images[currentIndex] : null;
@@ -3505,6 +3509,37 @@ def folder_key_condition(column, folder: str):
     return db.or_(column.like(f"classifier/{folder}/%"), column.like(f"{folder}/%"))
 
 
+def key_stem(key: str) -> str:
+    """Image key without its extension: rows saved against x.png still match x.webp."""
+    return os.path.splitext(key)[0]
+
+
+def key_variants(key: str) -> List[str]:
+    """All keys that refer to the same image as *key*, whatever its extension."""
+    stem = key_stem(key)
+    exts = IMAGE_EXTENSIONS + tuple(e.upper() for e in IMAGE_EXTENSIONS)
+    return list(dict.fromkeys([key] + [stem + e for e in exts]))
+
+
+def latest_per_image(records, per_user: bool = True) -> list:
+    """Collapse rows for the same image under different extensions, keeping the most recent
+    (per user for classifications; pass per_user=False for tag memberships)."""
+    out = {}
+    for r in sorted(records, key=lambda r: (getattr(r, 'timestamp', None) or getattr(r, 'created_at', None)
+                                            or dt.min, r.id)):
+        ident = (key_stem(r.image_key), r.user_id) if per_user else (key_stem(r.image_key), r.tag_id)
+        out[ident] = r
+    return list(out.values())
+
+
+def find_classification(user_id: int, key: str) -> Optional['Classification']:
+    """This user's classification of *key*, matched regardless of extension."""
+    records = Classification.query.filter(
+        Classification.user_id == user_id, Classification.image_key.in_(key_variants(key))
+    ).all()
+    return latest_per_image(records)[0] if records else None
+
+
 def list_all_image_keys(prefix: str) -> List[str]:
     """Paginate through all R2 objects under *prefix* and return image keys."""
     keys: List[str] = []
@@ -3566,8 +3601,8 @@ def get_images():
                     Classification.image_key.like(f"{folder}/%"),
                 )
             ).with_entities(Classification.image_key).distinct().all()
-            classified_keys = {r.image_key for r in classified_any}
-            filtered = [key for key in all_keys if key not in classified_keys]
+            classified_stems = {key_stem(r.image_key) for r in classified_any}
+            filtered = [key for key in all_keys if key_stem(key) not in classified_stems]
         except Exception as e:
             logger.error(f"Error computing no-votes filter: {e}", exc_info=True)
             filtered = []
@@ -3579,13 +3614,13 @@ def get_images():
             q = ImageTag.query.filter(folder_key_condition(ImageTag.image_key, folder))
             if filter_val.startswith('tag:'):
                 q = q.filter(ImageTag.tag_id == int(filter_val[4:]))
-            tagged_keys = {r.image_key for r in q.with_entities(ImageTag.image_key).distinct().all()}
+            tagged_stems = {key_stem(r.image_key) for r in q.with_entities(ImageTag.image_key).distinct().all()}
         except Exception as e:
             logger.error(f"Error computing tag filter: {e}", exc_info=True)
-            tagged_keys = set()
+            tagged_stems = set()
         if filter_val == 'Untagged':
-            return jsonify([key for key in all_keys if key not in tagged_keys])
-        return jsonify([key for key in all_keys if key in tagged_keys])
+            return jsonify([key for key in all_keys if key_stem(key) not in tagged_stems])
+        return jsonify([key for key in all_keys if key_stem(key) in tagged_stems])
 
     if filter_val in ('Agree', 'Disagree'):
         try:
@@ -3598,10 +3633,8 @@ def get_images():
                 )
             ).all()
             key_user_cat = {}
-            for r in records:
-                if r.image_key not in key_user_cat:
-                    key_user_cat[r.image_key] = {}
-                key_user_cat[r.image_key][r.user_id] = r.category
+            for r in latest_per_image(records):
+                key_user_cat.setdefault(key_stem(r.image_key), {})[r.user_id] = r.category
             target_keys = set()
             for img_key, user_cats in key_user_cat.items():
                 if len(user_cats) < 2:
@@ -3614,7 +3647,7 @@ def get_images():
         except Exception as e:
             logger.error(f"Error computing agreement filter: {e}", exc_info=True)
             target_keys = set()
-        return jsonify([key for key in all_keys if key in target_keys])
+        return jsonify([key for key in all_keys if key_stem(key) in target_keys])
 
     # Resolve which user's classifications to filter by
     filter_user_id = current_user.id
@@ -3627,14 +3660,14 @@ def get_images():
 
     try:
         user_classes = Classification.query.filter_by(user_id=filter_user_id).all()
-        class_map = {c.image_key: c.category for c in user_classes}
+        class_map = {key_stem(c.image_key): c.category for c in latest_per_image(user_classes)}
     except Exception as e:
         logger.error(f"Error fetching user classifications: {e}", exc_info=True)
         class_map = {}
 
     filtered = []
     for key in all_keys:
-        cat = class_map.get(key, "")
+        cat = class_map.get(key_stem(key), "")
         if filter_val == 'Uncategorized':
             if not cat: filtered.append(key)
         elif filter_val == 'Classified':
@@ -3678,7 +3711,7 @@ def get_classifications():
                 Classification.image_key.like(f"{folder}/%"),
             )
         ).all()
-        return jsonify({r.image_key: r.category for r in records})
+        return jsonify({r.image_key: r.category for r in latest_per_image(records)})
     except Exception as e:
         logger.error(f"Error fetching classifications for folder {folder}: {e}", exc_info=True)
         return jsonify({})
@@ -3792,13 +3825,17 @@ def get_image_tags():
         rows = db.session.query(ImageTag, Tag, User.username) \
             .join(Tag, ImageTag.tag_id == Tag.id) \
             .outerjoin(User, ImageTag.user_id == User.id) \
-            .filter(ImageTag.image_key == key) \
+            .filter(ImageTag.image_key.in_(key_variants(key))) \
             .order_by(db.func.lower(Tag.name)).all()
-        return jsonify({'tags': [
-            {'id': t.id, 'name': t.name, 'color': t.color, 'username': username,
-             'created_at': it.created_at.isoformat() if it.created_at else None}
-            for it, t, username in rows
-        ]})
+        seen = set()
+        out = []
+        for it, t, username in rows:
+            if t.id in seen:
+                continue
+            seen.add(t.id)
+            out.append({'id': t.id, 'name': t.name, 'color': t.color, 'username': username,
+                        'created_at': it.created_at.isoformat() if it.created_at else None})
+        return jsonify({'tags': out})
     except Exception as e:
         logger.error(f"Error fetching tags for key {key}: {e}", exc_info=True)
         return jsonify({'error': 'Database error'}), 500
@@ -3831,9 +3868,9 @@ def add_image_tags():
     if err:
         return jsonify(err[0]), err[1]
     try:
-        existing = {r.image_key for r in ImageTag.query.filter_by(tag_id=tag.id)
+        existing = {key_stem(r.image_key) for r in ImageTag.query.filter_by(tag_id=tag.id)
                     .with_entities(ImageTag.image_key).all()}
-        new_keys = [k for k in keys if k not in existing]
+        new_keys = [k for k in keys if key_stem(k) not in existing]
         for k in new_keys:
             db.session.add(ImageTag(tag_id=tag.id, image_key=k, user_id=current_user.id))
         db.session.commit()
@@ -3853,10 +3890,11 @@ def remove_image_tags():
         return jsonify(err[0]), err[1]
     try:
         removed = 0
+        variants = [v for k in keys for v in key_variants(k)]
         # Chunk the IN clause to stay under SQLite's bound-parameter limit
-        for i in range(0, len(keys), 500):
+        for i in range(0, len(variants), 500):
             removed += ImageTag.query.filter(
-                ImageTag.tag_id == tag.id, ImageTag.image_key.in_(keys[i:i + 500])
+                ImageTag.tag_id == tag.id, ImageTag.image_key.in_(variants[i:i + 500])
             ).delete(synchronize_session=False)
         db.session.commit()
         return jsonify({'status': 'success', 'changed': removed})
@@ -3884,6 +3922,8 @@ def export_tag(tag_id):
             .outerjoin(User, ImageTag.user_id == User.id) \
             .filter(ImageTag.tag_id == tag_id, folder_key_condition(ImageTag.image_key, folder)) \
             .order_by(ImageTag.image_key).all()
+        latest = {it.id for it in latest_per_image([it for it, _ in members], per_user=False)}
+        members = [(it, u) for it, u in members if it.id in latest]
     except Exception as e:
         logger.error(f"Tag export DB error: {e}", exc_info=True)
         return jsonify({'error': 'Database error'}), 500
@@ -3937,7 +3977,7 @@ def export_classifications():
         )
         if not all_users:
             q = q.filter_by(user_id=current_user.id)
-        records = q.order_by(Classification.image_key).all()
+        records = sorted(latest_per_image(q.all()), key=lambda r: r.image_key)
     except Exception as e:
         logger.error(f"Export DB error: {e}", exc_info=True)
         return jsonify({'error': 'Database error'}), 500
@@ -3963,7 +4003,9 @@ def export_classifications():
             .filter(folder_key_condition(ImageTag.image_key, folder)) \
             .order_by(db.func.lower(Tag.name)).all()
         for image_key, tag_name in tag_rows:
-            tag_map.setdefault(image_key, []).append(tag_name)
+            names = tag_map.setdefault(key_stem(image_key), [])
+            if tag_name not in names:
+                names.append(tag_name)
     except Exception as e:
         logger.error(f"Export tag lookup error: {e}", exc_info=True)
 
@@ -3978,7 +4020,7 @@ def export_classifications():
         row['image_key'] = r.image_key
         row['category'] = r.category or ''
         row['notes'] = (r.notes or '').replace('\n', ' ')
-        row['tags'] = ';'.join(tag_map.get(r.image_key, []))
+        row['tags'] = ';'.join(tag_map.get(key_stem(r.image_key), []))
         row['timestamp'] = r.timestamp.isoformat() if r.timestamp else ''
         if catalog:
             cat_row = catalog['rows'].get(stem, {})
@@ -4047,12 +4089,11 @@ def export_classifications():
 @login_required
 def get_data():
     key = request.args.get('key')
+    if not key:
+        return jsonify({'category': '', 'notes': ''})
     try:
-        record = Classification.query.filter_by(
-            user_id=current_user.id, 
-            image_key=key
-        ).first()
-        
+        record = find_classification(current_user.id, key)
+
         if record:
             return jsonify({'category': record.category, 'notes': record.notes})
         return jsonify({'category': '', 'notes': ''})
@@ -4071,10 +4112,11 @@ def get_data_batch():
     try:
         records = Classification.query.filter(
             Classification.user_id == current_user.id,
-            Classification.image_key.in_(keys)
+            Classification.image_key.in_([v for k in keys for v in key_variants(k)])
         ).all()
-        found = {r.image_key: {'category': r.category or '', 'notes': r.notes or ''} for r in records}
-        return jsonify({k: found.get(k, {'category': '', 'notes': ''}) for k in keys})
+        found = {key_stem(r.image_key): {'category': r.category or '', 'notes': r.notes or ''}
+                 for r in latest_per_image(records)}
+        return jsonify({k: found.get(key_stem(k), {'category': '', 'notes': ''}) for k in keys})
     except Exception as e:
         logger.error(f"Error fetching batch data: {e}", exc_info=True)
         return jsonify({'error': 'Database error'}), 500
@@ -4086,19 +4128,19 @@ def get_stats():
     if not key: return jsonify({'error': 'No key provided'}), 400
 
     try:
-        count_results = db.session.query(Classification.category, db.func.count(Classification.category)) \
-            .filter_by(image_key=key) \
-            .group_by(Classification.category).all()
-        counts = {r[0]: r[1] for r in count_results if r[0]}
-
-        vote_records = db.session.query(Classification, User).join(
-            User, Classification.user_id == User.id
-        ).filter(
-            Classification.image_key == key,
-            Classification.category != None,
-            Classification.category != ''
-        ).order_by(User.username).all()
-        votes = [{'username': u.username, 'category': c.category} for c, u in vote_records]
+        records = latest_per_image(
+            Classification.query.filter(Classification.image_key.in_(key_variants(key))).all()
+        )
+        names = {u.id: u.username for u in
+                 User.query.filter(User.id.in_([r.user_id for r in records])).all()} if records else {}
+        counts: Dict[str, int] = {}
+        votes = []
+        for r in records:
+            if r.category:
+                counts[r.category] = counts.get(r.category, 0) + 1
+                if r.user_id in names:
+                    votes.append({'username': names[r.user_id], 'category': r.category})
+        votes.sort(key=lambda v: v['username'])
 
         return jsonify({'counts': counts, 'votes': votes})
     except Exception as e:
@@ -4111,11 +4153,11 @@ def save_data():
     try:
         data = request.json
         key = data.get('key')
-        
-        record = Classification.query.filter_by(
-            user_id=current_user.id, 
-            image_key=key
-        ).first()
+        if not key:
+            return jsonify({'error': 'No key provided'}), 400
+
+        # Updates an existing row saved under another extension rather than duplicating it
+        record = find_classification(current_user.id, key)
 
         if not record:
             record = Classification(user_id=current_user.id, image_key=key)
@@ -4383,15 +4425,16 @@ def get_my_assignment():
 @login_required
 def dashboard_summary():
     """Aggregate classification stats per folder and user from the DB."""
-    records = db.session.query(
-        Classification.image_key, Classification.user_id, Classification.category, User.username
-    ).join(User, Classification.user_id == User.id).filter(
+    records = db.session.query(Classification, User.username) \
+        .join(User, Classification.user_id == User.id).filter(
         Classification.category != None,
         Classification.category != ''
     ).all()
+    usernames = {c.id: username for c, username in records}
 
     folder_data: Dict[str, Dict] = {}
-    for image_key, user_id, category, username in records:
+    for c in latest_per_image([c for c, _ in records]):
+        image_key, user_id, category, username = key_stem(c.image_key), c.user_id, c.category, usernames[c.id]
         parts = image_key.split('/')
         if len(parts) >= 3 and parts[0] == 'classifier':
             folder = parts[1]
@@ -4507,7 +4550,7 @@ def bulk_import_preview():
                 Classification.image_key.like(f"{folder}/%"),
             )
         ).all()
-        existing_map = {r.image_key: r.category for r in existing}
+        existing_map = {key_stem(r.image_key): r.category for r in latest_per_image(existing)}
     except Exception as e:
         logger.error(f"Error fetching existing classifications: {e}", exc_info=True)
         existing_map = {}
@@ -4529,7 +4572,7 @@ def bulk_import_preview():
         if key is None:
             unmatched.append(row_id)
         else:
-            current_cat = existing_map.get(key, '')
+            current_cat = existing_map.get(key_stem(key), '')
             matched.append({
                 'id': row_id,
                 'key': key,
@@ -4569,9 +4612,7 @@ def bulk_import_commit():
             continue
 
         try:
-            record = Classification.query.filter_by(
-                user_id=current_user.id, image_key=key
-            ).first()
+            record = find_classification(current_user.id, key)
             if not record:
                 record = Classification(user_id=current_user.id, image_key=key)
                 db.session.add(record)
@@ -4610,11 +4651,14 @@ def get_compare():
             )
         ).all()
 
-        by_key: Dict[str, Dict[str, str]] = {}
-        for r in records:
-            if r.image_key not in by_key:
-                by_key[r.image_key] = {}
-            by_key[r.image_key][str(r.user_id)] = r.category
+        # Group by stem so votes on x.png and x.webp land on one row
+        by_stem: Dict[str, Dict[str, str]] = {}
+        stem_key: Dict[str, str] = {}
+        for r in latest_per_image(records):
+            stem = key_stem(r.image_key)
+            stem_key.setdefault(stem, r.image_key)
+            by_stem.setdefault(stem, {})[str(r.user_id)] = r.category
+        by_key = {stem_key[s]: v for s, v in by_stem.items()}
 
         return jsonify({
             'users': [{'id': str(u.id), 'username': u.username} for u in users],
