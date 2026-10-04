@@ -916,6 +916,10 @@ APP_TEMPLATE = """
         .btn-secondary { width: 100%; padding: 8px; background: #e5e7eb; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer; margin-bottom: 10px; font-weight: 600; font-size: 0.9rem; }
         .btn-secondary:hover { background: #d1d5db; }
         .btn-secondary.active { background: #fef3c7; border-color: #f59e0b; color: #92400e; }
+        .play-row { display: none; align-items: center; gap: 8px; margin-bottom: 0.5rem; }
+        .play-row .btn-secondary { width: auto; margin: 0; padding: 6px 12px; white-space: nowrap; }
+        .play-row input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+        .play-row .play-speed { font-size: 0.8rem; color: var(--text-sub); min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
         /* Tags */
         .tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 0.5rem; min-height: 28px; }
         .tag-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px; border: 1px solid; font-size: 0.8rem; cursor: pointer; background: white; user-select: none; line-height: 1.2; transition: background 0.15s, color 0.15s; }
@@ -1243,6 +1247,11 @@ APP_TEMPLATE = """
 
         <button id="btn-shuffle" class="btn-secondary" onclick="toggleShuffle()" style="display:none; margin-bottom:0.5rem;">Shuffle</button>
         <button id="btn-autoscroll" class="btn-secondary" onclick="toggleAutoscroll()" style="display:none; margin-bottom:0.5rem;" title="After classifying, jump straight to the next image">Autoscroll</button>
+        <div id="play-row" class="play-row">
+            <button id="btn-play" class="btn-secondary" onclick="togglePlay()" title="Advance through images automatically (Space)">&#9654; Play</button>
+            <input type="range" id="play-speed" min="0.5" max="10" step="0.5" value="2" oninput="setPlaySpeed(this.value)" title="Seconds per image">
+            <span id="play-speed-label" class="play-speed">2.0 s</span>
+        </div>
         <div class="nav-row">
             <button class="btn-nav" onclick="navigate(-1)">Previous</button>
             <button class="btn-nav" onclick="navigate(1)">Next</button>
@@ -1472,6 +1481,10 @@ APP_TEMPLATE = """
     let importParsedData = null;
     let shuffleMode = false;
     let autoscrollMode = false;
+    let playing = false;      // timed slideshow, available while autoscroll is on
+    let playTimer = null;
+    let playSeconds = 2;
+    try { playSeconds = Math.min(10, Math.max(0.5, parseFloat(localStorage.getItem('classifierPlaySeconds')) || 2)); } catch (e) {}
     let currentAssignment = null;
     let showAssignedOnly = false;
     let maskPassIds = null; // null = no mask active; Set<string> = IDs passing the mask expr
@@ -1608,7 +1621,14 @@ APP_TEMPLATE = """
 
         // 3. Setup Shortcuts
         document.addEventListener('keydown', (e) => {
-            if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+            if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && e.target.type !== 'range')) return;
+
+            // Space: pause/resume the slideshow (only while autoscroll is on)
+            if (e.key === ' ' && autoscrollMode) {
+                e.preventDefault(); // don't scroll or "click" the focused button
+                togglePlay();
+                return;
+            }
             
             // Navigation
             if (e.key === "ArrowLeft") navigate(-1);
@@ -1733,6 +1753,7 @@ APP_TEMPLATE = """
         currentAssignment = null;
         showAssignedOnly = false;
         shuffleMode = false;
+        setPlaying(false);
         maskPassIds = null;
         currentImageTags = new Map();
         document.getElementById('mask-expr-input').value = '';
@@ -2948,11 +2969,60 @@ APP_TEMPLATE = """
         const btn = document.getElementById('btn-autoscroll');
         btn.classList.toggle('active', autoscrollMode);
         btn.textContent = autoscrollMode ? 'Autoscroll: On' : 'Autoscroll';
+        renderPlayControls();
     }
 
     function toggleAutoscroll() {
         autoscrollMode = !autoscrollMode;
+        if (!autoscrollMode) setPlaying(false);
         renderAutoscrollBtn();
+    }
+
+    // --- Slideshow (play/pause) ---
+
+    function renderPlayControls() {
+        document.getElementById('play-row').style.display = autoscrollMode ? 'flex' : 'none';
+        const btn = document.getElementById('btn-play');
+        btn.innerHTML = playing ? '&#10074;&#10074; Pause' : '&#9654; Play';
+        btn.classList.toggle('active', playing);
+        document.getElementById('play-speed').value = playSeconds;
+        document.getElementById('play-speed-label').textContent = playSeconds.toFixed(1) + ' s';
+    }
+
+    function setPlaying(on) {
+        playing = on && images.length > 0;
+        clearTimeout(playTimer);
+        playTimer = null;
+        if (playing) {
+            // Pressing play on the last image restarts from the first
+            if (currentIndex >= images.length - 1) loadStateForImage(0);
+            else schedulePlayTick();
+        }
+        renderPlayControls();
+    }
+
+    function togglePlay() { setPlaying(!playing); }
+
+    // Each image gets the full interval, however it was reached (tick, arrow key, classifying)
+    function schedulePlayTick() {
+        clearTimeout(playTimer);
+        if (!playing) return;
+        playTimer = setTimeout(() => {
+            if (!playing) return;
+            if (currentIndex < images.length - 1) {
+                loadStateForImage(currentIndex + 1); // no save: viewing alone shouldn't write rows
+            } else {
+                setPlaying(false);
+                showToast('Reached the last image');
+            }
+        }, playSeconds * 1000);
+    }
+
+    function setPlaySpeed(v) {
+        playSeconds = Math.min(10, Math.max(0.5, parseFloat(v) || 2));
+        try { localStorage.setItem('classifierPlaySeconds', String(playSeconds)); } catch (e) {}
+        renderPlayControls();
+        schedulePlayTick();
     }
 
     // --- Assignments ---
@@ -3169,6 +3239,7 @@ APP_TEMPLATE = """
         }
 
         prefetchAround(index);
+        schedulePlayTick();
     }
 
     function highlightCategory(cat) {
