@@ -914,6 +914,10 @@ APP_TEMPLATE = """
         .tag-new-row input { flex: 1; min-width: 0; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.85rem; }
         .tag-new-row button { padding: 6px 12px; background: #e5e7eb; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem; white-space: nowrap; }
         .tag-new-row button:hover { background: #d1d5db; }
+        .bulk-cat-row { display: flex; gap: 6px; align-items: center; margin: -0.5rem 0 1rem; }
+        .bulk-cat-row select { flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.82rem; background: white; }
+        .bulk-cat-row button { padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 6px; background: white; cursor: pointer; font-size: 0.8rem; font-weight: 600; color: #374151; white-space: nowrap; }
+        .bulk-cat-row button:hover { background: #f3f4f6; }
         .tag-manage-box { background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 8px 10px; margin-bottom: 1rem; font-size: 0.82rem; color: #92400e; display: none; }
         .tag-manage-box .row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
         .tag-manage-box select { flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.82rem; background: white; }
@@ -1144,10 +1148,12 @@ APP_TEMPLATE = """
                 </div>
             </div>
 
-            <label style="display:flex; align-items:center; gap:6px; font-size:0.85rem; color:var(--text-sub); margin-bottom:1rem; cursor:pointer;">
-                <input type="checkbox" id="filter-no-catalog" onchange="applyAllFilters()">
-                Show only images not in catalog
-            </label>
+            <label class="section-label">Catalog Membership</label>
+            <select id="catalog-membership" class="dropdown" onchange="applyAllFilters()">
+                <option value="">All images</option>
+                <option value="in">Hide images not in catalog</option>
+                <option value="out">Show only images not in catalog</option>
+            </select>
 
             <label class="section-label">Mask Expression</label>
             <input type="text" id="mask-expr-input" class="mask-expr-input"
@@ -1169,6 +1175,10 @@ APP_TEMPLATE = """
 
         <label class="section-label">Classification</label>
         <div id="category-container" class="btn-grid"></div>
+        <div class="bulk-cat-row">
+            <select id="bulk-cat-select" title="Category to apply in bulk"></select>
+            <button onclick="bulkClassify()" title="Set this category on every image in the current filtered list (asks for confirmation)">Apply to all <span id="bulk-cat-count">0</span> shown</button>
+        </div>
         
         <!-- Stats Toggle -->
         <button id="btn-stats" class="btn-secondary" onclick="toggleStats()">Show Community Stats</button>
@@ -1554,6 +1564,10 @@ APP_TEMPLATE = """
             container.appendChild(btn);
         });
 
+        const bulkSelect = document.getElementById('bulk-cat-select');
+        bulkSelect.innerHTML = '';
+        categories.forEach(cat => bulkSelect.add(new Option(cat, cat)));
+
         const filterGroup = document.getElementById('filter-group-categories');
         filterGroup.innerHTML = '';
         categories.forEach(cat => {
@@ -1714,7 +1728,7 @@ APP_TEMPLATE = """
         document.getElementById('catalog-loading').style.display = 'block';
         document.getElementById('catalog-props-box').style.display = 'none';
         closeSkyPlot();
-        document.getElementById('filter-no-catalog').checked = false;
+        document.getElementById('catalog-membership').value = '';
         document.getElementById('export-section').style.display = 'block';
         document.getElementById('btn-compare').style.display = 'block';
         document.getElementById('btn-shuffle').style.display = 'block';
@@ -1873,9 +1887,11 @@ APP_TEMPLATE = """
                 });
             }
 
-            // 2. Not-in-catalog filter
-            if (document.getElementById('filter-no-catalog').checked) {
-                result = result.filter(key => !catalogData.rows[getImageId(key)]);
+            // 2. Catalog membership filter
+            const membership = document.getElementById('catalog-membership').value;
+            if (membership) {
+                const wantIn = membership === 'in';
+                result = result.filter(key => !!catalogData.rows[getImageId(key)] === wantIn);
             }
 
             // 3. Mask expression filter (server-computed; IDs not in catalog are kept)
@@ -1924,6 +1940,7 @@ APP_TEMPLATE = """
 
         images = result;
         document.getElementById('tag-bulk-count').textContent = images.length;
+        document.getElementById('bulk-cat-count').textContent = images.length;
 
         if (images.length > 0) {
             // Stay on the current image if it survived the filter; otherwise go to 0
@@ -2237,6 +2254,47 @@ APP_TEMPLATE = """
             if (currentIndex >= 0 && currentIndex < images.length) fetchImageTags(images[currentIndex]);
         } catch(e) {
             console.error('Error bulk tagging:', e);
+        }
+    }
+
+    // Set one category on every image in the current filtered list, after a confirmation
+    // that says how many existing classifications would be overwritten.
+    async function bulkClassify() {
+        const category = document.getElementById('bulk-cat-select').value;
+        if (!category) { alert('No category selected'); return; }
+        if (images.length === 0) return;
+        const keys = [...images];
+        const post = async dryRun => {
+            const res = await fetch('/api/save_batch', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ keys, category, dry_run: dryRun })
+            });
+            return { ok: res.ok, data: await res.json() };
+        };
+        try {
+            await saveCurrentState(); // keep any unsaved notes on the current image
+            const preview = await post(true);
+            if (!preview.ok) { alert(preview.data.error || 'Bulk classify failed'); return; }
+            const p = preview.data;
+            const lines = [`Classify all ${keys.length} images currently shown as "${category}"?`, ''];
+            lines.push(`${p.new} unclassified image(s) will be set.`);
+            if (p.overwrite) lines.push(`${p.overwrite} image(s) you already classified differently will be OVERWRITTEN.`);
+            if (p.unchanged) lines.push(`${p.unchanged} image(s) are already "${category}".`);
+            if (!confirm(lines.join('\\n'))) return;
+
+            const result = await post(false);
+            if (!result.ok) { alert(result.data.error || 'Bulk classify failed'); return; }
+            showToast(`Classified ${result.data.changed} image(s) as "${category}"`, 2500);
+            dataCache.clear();
+            if (document.getElementById('filter-select').value !== 'All') {
+                await fetchImages(); // classification-based filters may now exclude these images
+            } else if (currentIndex >= 0) {
+                loadStateForImage(currentIndex);
+            }
+        } catch(e) {
+            console.error('Error bulk classifying:', e);
+            alert('Bulk classify failed');
         }
     }
 
@@ -4171,6 +4229,54 @@ def save_data():
     except Exception as e:
         logger.error(f"Error saving data: {e}", exc_info=True)
         return jsonify({'error': 'Database save error'}), 500
+
+@app.route('/api/save_batch', methods=['POST'])
+@login_required
+def save_data_batch():
+    """Set this user's category on many images at once (notes untouched).
+    With dry_run, only report how many would be new / overwritten / unchanged."""
+    data = request.json or {}
+    keys = list(dict.fromkeys(k for k in (data.get('keys') or []) if isinstance(k, str) and k))
+    category = str(data.get('category') or '').strip()
+    if not keys:
+        return jsonify({'error': 'No image keys provided'}), 400
+    if not category:
+        return jsonify({'error': 'No category provided'}), 400
+    try:
+        # One query for all of this user's rows beats an IN over every extension variant
+        stems = {key_stem(k) for k in keys}
+        by_stem = {key_stem(r.image_key): r for r in latest_per_image(
+            Classification.query.filter_by(user_id=current_user.id).all())
+            if key_stem(r.image_key) in stems}
+        counts = {'new': 0, 'overwrite': 0, 'unchanged': 0}
+        for k in keys:
+            r = by_stem.get(key_stem(k))
+            if r is not None and r.category == category:
+                counts['unchanged'] += 1
+            elif r is not None and r.category:
+                counts['overwrite'] += 1
+            else:
+                counts['new'] += 1
+        if data.get('dry_run'):
+            return jsonify(counts)
+
+        changed = 0
+        for k in keys:
+            r = by_stem.get(key_stem(k))
+            if r is None:
+                r = Classification(user_id=current_user.id, image_key=k)
+                db.session.add(r)
+                by_stem[key_stem(k)] = r
+            if r.category != category:
+                r.category = category
+                changed += 1
+        db.session.commit()
+        logger.info(f"Bulk classify by user {current_user.id}: {changed} of {len(keys)} set to '{category}'")
+        return jsonify({'status': 'success', 'changed': changed, **counts})
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error bulk classifying {len(keys)} image(s): {e}", exc_info=True)
+        return jsonify({'error': 'Database error'}), 500
 
 @app.route('/api/db_backup')
 @login_required
