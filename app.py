@@ -97,8 +97,9 @@ class TableQueryParser:
     """Parse a filter expression string and apply it to an astropy Table as a boolean mask.
 
     Supports: comparisons (<, <=, >, >=, ==, !=), logic (&, |, ^), arithmetic (+, -,
-    *, /), unary (~, -, +), grouping (), functions (log10, log, sqrt, abs, exp), and
-    column indexing (col[i] → col[:, i]).
+    *, /), unary (~, -, +), grouping (), functions (log10, log, sqrt, abs, exp, isnan,
+    isfinite), and column indexing (col[i] → col[:, i]). String columns compare as
+    stripped str (FITS stores bytes); masked entries read as NaN (numeric) or ''.
     """
 
     _OPERATORS = {
@@ -112,6 +113,7 @@ class TableQueryParser:
     }
     _FUNCTIONS = {
         'log10': np.log10, 'log': np.log, 'sqrt': np.sqrt, 'abs': np.abs, 'exp': np.exp,
+        'isnan': np.isnan, 'isfinite': np.isfinite,
     }
 
     def __init__(self, table):
@@ -127,9 +129,22 @@ class TableQueryParser:
 
     def _lookup_column(self, name: str) -> np.ndarray:
         src = self._source
-        if name in src.colnames:
-            return np.asarray(src[name])
-        raise ValueError(f"Column '{name}' not found. Available: {list(src.colnames)}")
+        if name not in src.colnames:
+            raise ValueError(f"Column '{name}' not found. Available: {list(src.colnames)}")
+        col = src[name]
+        arr = np.asarray(col)
+        # FITS strings are padded bytes, which never equal a str literal
+        if arr.dtype.kind == 'S':
+            arr = np.char.strip(np.char.decode(arr, 'utf-8', 'replace'))
+        elif arr.dtype.kind == 'U':
+            arr = np.char.strip(arr)
+        # Masked entries hold arbitrary fill data; make them NaN / '' so they match nothing
+        mask = getattr(col, 'mask', None)
+        if mask is not None and np.any(mask):
+            if arr.dtype.kind in 'iub':
+                arr = arr.astype(float)
+            arr = np.where(mask, '' if arr.dtype.kind == 'U' else np.nan, arr)
+        return arr
 
     def _eval_slice(self, node):
         return slice(
@@ -194,6 +209,8 @@ class TableQueryParser:
 
 def _serialize_fits_value(val):
     """Convert a FITS/numpy scalar to a JSON-serialisable Python type."""
+    if val is np.ma.masked:        # missing entry: .item() would report 0.0
+        return None
     if hasattr(val, 'item'):       # numpy scalar
         val = val.item()
     if isinstance(val, bytes):
@@ -1157,7 +1174,8 @@ APP_TEMPLATE = """
 
             <label class="section-label">Mask Expression</label>
             <input type="text" id="mask-expr-input" class="mask-expr-input"
-                placeholder="e.g. mag &lt; 20 &amp; snr &gt; 5"
+                placeholder="e.g. mag &lt; 20 &amp; (MODEL_TYPE == 'SimpleGalaxy')"
+                title="Operators: &lt; &lt;= &gt; &gt;= == != &amp; | ~ + - * /. Wrap each comparison in () when combining with &amp; or |. Functions: log10, log, sqrt, abs, exp, isnan, isfinite. Missing values match isnan(col)."
                 onkeydown="if(event.key==='Enter') applyMaskExpr()">
             <div class="mask-expr-row">
                 <button class="btn-secondary" onclick="applyMaskExpr()"
