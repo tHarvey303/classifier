@@ -1249,7 +1249,7 @@ APP_TEMPLATE = """
         <button id="btn-autoscroll" class="btn-secondary" onclick="toggleAutoscroll()" style="display:none; margin-bottom:0.5rem;" title="After classifying, jump straight to the next image">Autoscroll</button>
         <div id="play-row" class="play-row">
             <button id="btn-play" class="btn-secondary" onclick="togglePlay()" title="Advance through images automatically (Space)">&#9654; Play</button>
-            <input type="range" id="play-speed" min="0.5" max="10" step="0.5" value="2" oninput="setPlaySpeed(this.value)" title="Seconds per image">
+            <input type="range" id="play-speed" min="0.2" max="10" step="0.1" value="2" oninput="setPlaySpeed(this.value)" title="Seconds per image">
             <span id="play-speed-label" class="play-speed">2.0 s</span>
         </div>
         <div class="nav-row">
@@ -1484,7 +1484,7 @@ APP_TEMPLATE = """
     let playing = false;      // timed slideshow, available while autoscroll is on
     let playTimer = null;
     let playSeconds = 2;
-    try { playSeconds = Math.min(10, Math.max(0.5, parseFloat(localStorage.getItem('classifierPlaySeconds')) || 2)); } catch (e) {}
+    try { playSeconds = Math.min(10, Math.max(0.2, parseFloat(localStorage.getItem('classifierPlaySeconds')) || 2)); } catch (e) {}
     let currentAssignment = null;
     let showAssignedOnly = false;
     let maskPassIds = null; // null = no mask active; Set<string> = IDs passing the mask expr
@@ -3019,7 +3019,7 @@ APP_TEMPLATE = """
     }
 
     function setPlaySpeed(v) {
-        playSeconds = Math.min(10, Math.max(0.5, parseFloat(v) || 2));
+        playSeconds = Math.min(10, Math.max(0.2, parseFloat(v) || 2));
         try { localStorage.setItem('classifierPlaySeconds', String(playSeconds)); } catch (e) {}
         renderPlayControls();
         schedulePlayTick();
