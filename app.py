@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import io
 import json
 import math
@@ -6,6 +7,7 @@ import operator
 import os
 import sys
 import logging
+import secrets
 import sqlite3
 import tempfile
 from datetime import datetime as dt
@@ -364,9 +366,60 @@ class ImageTag(db.Model):
     created_at = db.Column(db.DateTime, server_default=db.func.now())
     __table_args__ = (db.UniqueConstraint('tag_id', 'image_key', name='_tag_image_uc'),)
 
+class ApiToken(db.Model):
+    """Personal token letting a script download exports without a browser session."""
+    __tablename__ = 'api_tokens'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    token_hash = db.Column(db.String(64), unique=True, nullable=False)  # sha256 hex; plaintext is never stored
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    last_used_at = db.Column(db.DateTime, nullable=True)
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
+
+# Endpoints an API token may call. Tokens are read-only: they can download exports but not
+# classify, tag or reach admin routes, so a leaked token only exposes the sample.
+TOKEN_ENDPOINTS = {'export_classifications', 'export_tag'}
+
+
+def hash_api_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def request_api_token() -> Optional[str]:
+    """Token from an 'Authorization: Bearer ...' header, or a ?token= query parameter."""
+    auth = request.headers.get('Authorization', '')
+    if auth.lower().startswith('bearer '):
+        return auth[7:].strip() or None
+    return request.args.get('token') or None
+
+
+@login_manager.request_loader
+def load_user_from_token(req):
+    if req.endpoint not in TOKEN_ENDPOINTS:
+        return None
+    token = request_api_token()
+    if not token:
+        return None
+    row = ApiToken.query.filter_by(token_hash=hash_api_token(token)).first()
+    if not row:
+        return None
+    row.last_used_at = dt.utcnow()
+    db.session.commit()
+    return User.query.get(row.user_id)
+
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    # Scripts presenting a token get a plain 401 rather than a redirect to the login page
+    if request_api_token():
+        return jsonify({'error': 'Invalid or revoked API token'}), 401
+    # Otherwise behave like Flask-Login's default: flash and bounce to the login page
+    flash(login_manager.login_message, login_manager.login_message_category)
+    return redirect(url_for('login', next=request.url))
 
 # --- HTML Templates ---
 
@@ -790,6 +843,18 @@ DASHBOARD_TEMPLATE = """
         .cat-pills { margin-top: 6px; }
         .cat-pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; background: #f3f4f6; color: #374151; margin: 2px 2px 0 0; }
         .no-data { text-align: center; padding: 3rem; color: #9ca3af; }
+        .tok-card { background: white; border-radius: 10px; padding: 1.25rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 2rem; font-size: 0.875rem; }
+        .tok-card p { margin: 0 0 0.75rem; color: #6b7280; }
+        .tok-new { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+        .tok-new input { flex: 1; max-width: 280px; padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.85rem; }
+        .tok-row { display: flex; align-items: center; gap: 1rem; padding: 6px 0; border-top: 1px solid #f3f4f6; }
+        .tok-row .tok-name { font-weight: 600; min-width: 120px; }
+        .tok-row .tok-meta { color: #9ca3af; font-size: 0.8rem; flex: 1; }
+        .tok-row button { padding: 3px 10px; border: 1px solid #fecaca; color: #b91c1c; background: white; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
+        .tok-reveal { display: none; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 0.75rem; }
+        .tok-reveal code, .tok-card pre { font-family: ui-monospace, monospace; font-size: 0.8rem; }
+        .tok-reveal code { word-break: break-all; background: white; padding: 2px 6px; border-radius: 4px; }
+        .tok-card pre { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 0.6rem 0.8rem; overflow-x: auto; margin: 0.5rem 0 0; }
     </style>
 </head>
 <body>
@@ -813,8 +878,72 @@ DASHBOARD_TEMPLATE = """
     </div>
     <div class="top-row"><h2>Per-folder progress</h2></div>
     <div id="folder-list"><div class="no-data">Loading&#8230;</div></div>
+
+    <div class="top-row" style="margin-top:2rem;"><h2>API tokens</h2></div>
+    <div class="tok-card">
+        <p>A token lets a script download your exports (CSV/FITS) without logging in. Tokens can only download &mdash; they cannot classify or change anything. Use the &ldquo;API URL&rdquo; buttons next to the export buttons to get the URL for a folder.</p>
+        <div class="tok-new">
+            <input id="tok-name" placeholder="Token name, e.g. laptop script" maxlength="100">
+            <button class="btn-refresh" onclick="createToken()">Create token</button>
+        </div>
+        <div class="tok-reveal" id="tok-reveal">
+            <div style="margin-bottom:6px;"><b>Copy this token now &mdash; it will not be shown again.</b></div>
+            <code id="tok-value"></code> <button class="btn-refresh" onclick="copyToken()">Copy</button>
+            <pre id="tok-example"></pre>
+        </div>
+        <div id="tok-list"></div>
+    </div>
 </div>
 <script>
+function fmtDate(iso) { return iso ? new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).toLocaleString() : 'never'; }
+
+async function loadTokens() {
+    const toks = await (await fetch('/api/tokens')).json();
+    const el = document.getElementById('tok-list');
+    el.innerHTML = toks.length ? '' : '<div style="color:#9ca3af;">No tokens yet.</div>';
+    toks.forEach(t => {
+        const row = document.createElement('div');
+        row.className = 'tok-row';
+        row.innerHTML = `<span class="tok-name"></span>
+            <span class="tok-meta">created ${fmtDate(t.created_at)} &middot; last used ${fmtDate(t.last_used_at)}</span>
+            <button>Revoke</button>`;
+        row.querySelector('.tok-name').textContent = t.name;
+        row.querySelector('button').onclick = () => revokeToken(t.id, t.name);
+        el.appendChild(row);
+    });
+}
+
+async function createToken() {
+    const name = document.getElementById('tok-name').value.trim();
+    const res = await fetch('/api/tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                             body: JSON.stringify({ name }) });
+    const data = await res.json();
+    if (!res.ok) { alert(data.error || 'Could not create token'); return; }
+    document.getElementById('tok-name').value = '';
+    document.getElementById('tok-value').textContent = data.token;
+    document.getElementById('tok-example').textContent =
+`import io, os, requests
+from astropy.table import Table
+
+r = requests.get("${location.origin}/api/export",
+                 params={"folder": "<folder>", "format": "fits", "all_users": "true"},
+                 headers={"Authorization": "Bearer " + os.environ["CLASSIFIER_TOKEN"]})
+r.raise_for_status()
+t = Table.read(io.BytesIO(r.content), format="fits")`;
+    document.getElementById('tok-reveal').style.display = 'block';
+    loadTokens();
+}
+
+function copyToken() {
+    navigator.clipboard.writeText(document.getElementById('tok-value').textContent);
+}
+
+async function revokeToken(id, name) {
+    if (!confirm(`Revoke token "${name}"? Scripts using it will stop working.`)) return;
+    await fetch(`/api/tokens/${id}`, { method: 'DELETE' });
+    loadTokens();
+}
+
 const PALETTE = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316','#6366f1'];
 
 async function load() {
@@ -869,6 +998,7 @@ async function load() {
 }
 
 load();
+loadTokens();
 </script>
 </body>
 </html>
@@ -1239,6 +1369,10 @@ APP_TEMPLATE = """
                 <label class="export-check">
                     <input type="checkbox" id="export-all-users"> All users
                 </label>
+            </div>
+            <div class="export-row" style="margin-top:0.4rem;">
+                <button class="btn-export" onclick="copyExportUrl('csv')" title="Copy a URL scripts can fetch with an API token (create one on the Dashboard)">&#128279; API URL (CSV)</button>
+                <button class="btn-export" onclick="copyExportUrl('fits')" title="Copy a URL scripts can fetch with an API token (create one on the Dashboard)">&#128279; API URL (FITS)</button>
             </div>
             <div class="export-row" style="margin-top:0.4rem;">
                 <button class="btn-export" onclick="openImport()" style="color:#059669; border-color:#a7f3d0;">&#8593; Import CSV / FITS</button>
@@ -3301,6 +3435,18 @@ APP_TEMPLATE = """
         window.location.href = url;
     }
 
+    async function copyExportUrl(fmt) {
+        if (!currentFolder) return;
+        const allUsers = document.getElementById('export-all-users').checked;
+        const url = `${location.origin}/api/export?folder=${encodeURIComponent(currentFolder)}&format=${fmt}&all_users=${allUsers}`;
+        try {
+            await navigator.clipboard.writeText(url);
+            showToast('API URL copied - fetch it with an API token (see Dashboard)', 3000);
+        } catch (e) {
+            prompt('API URL (fetch it with an API token from the Dashboard):', url);
+        }
+    }
+
     init();
 </script>
 </body>
@@ -4099,21 +4245,28 @@ def export_tag(tag_id):
     safe_tag = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in tag.name)
     return app.response_class(
         buf.getvalue(), mimetype='text/csv',
-        headers={'Content-Disposition': f'attachment; filename="{safe_folder}_tag_{safe_tag}.csv"'}
+        headers={'Content-Disposition': f'attachment; filename="{safe_folder}_tag_{safe_tag}.csv"', 'Cache-Control': 'no-store'}
     )
 
 
 @app.route('/api/export')
 @login_required
 def export_classifications():
-    """Download classifications for a folder as CSV or FITS, optionally joined with catalog columns."""
+    """Download classifications for a folder as CSV or FITS, optionally joined with catalog columns.
+
+    Also callable from scripts with an API token (see TOKEN_ENDPOINTS). ?category=a,b keeps only
+    those categories.
+    """
     import csv as csv_mod
     folder = request.args.get('folder')
     fmt = request.args.get('format', 'csv').lower()
     all_users = request.args.get('all_users', 'false').lower() == 'true'
+    categories = {c.strip() for c in request.args.get('category', '').split(',') if c.strip()}
 
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
+    if folder_hidden_for_current_user(folder):
+        abort(403)
 
     try:
         q = Classification.query.filter(
@@ -4125,6 +4278,8 @@ def export_classifications():
         if not all_users:
             q = q.filter_by(user_id=current_user.id)
         records = sorted(latest_per_image(q.all()), key=lambda r: r.image_key)
+        if categories:
+            records = [r for r in records if (r.category or '') in categories]
     except Exception as e:
         logger.error(f"Export DB error: {e}", exc_info=True)
         return jsonify({'error': 'Database error'}), 500
@@ -4213,7 +4368,7 @@ def export_classifications():
             return app.response_class(
                 buf.read(),
                 mimetype='application/octet-stream',
-                headers={'Content-Disposition': f'attachment; filename="{safe_folder}_classifications.fits"'}
+                headers={'Content-Disposition': f'attachment; filename="{safe_folder}_classifications.fits"', 'Cache-Control': 'no-store'}
             )
         except Exception as e:
             logger.error(f"FITS export error: {e}", exc_info=True)
@@ -4228,8 +4383,41 @@ def export_classifications():
         return app.response_class(
             buf.getvalue(),
             mimetype='text/csv',
-            headers={'Content-Disposition': f'attachment; filename="{safe_folder}_classifications.csv"'}
+            headers={'Content-Disposition': f'attachment; filename="{safe_folder}_classifications.csv"', 'Cache-Control': 'no-store'}
         )
+
+
+@app.route('/api/tokens')
+@login_required
+def list_api_tokens():
+    tokens = ApiToken.query.filter_by(user_id=current_user.id).order_by(ApiToken.created_at).all()
+    return jsonify([{
+        'id': t.id, 'name': t.name,
+        'created_at': t.created_at.isoformat() if t.created_at else None,
+        'last_used_at': t.last_used_at.isoformat() if t.last_used_at else None,
+    } for t in tokens])
+
+
+@app.route('/api/tokens', methods=['POST'])
+@login_required
+def create_api_token():
+    name = ((request.get_json(silent=True) or {}).get('name') or '').strip()[:100] or 'script'
+    token = 'clf_' + secrets.token_urlsafe(32)
+    db.session.add(ApiToken(user_id=current_user.id, name=name, token_hash=hash_api_token(token)))
+    db.session.commit()
+    # The plaintext token is returned this once only
+    return jsonify({'name': name, 'token': token})
+
+
+@app.route('/api/tokens/<int:token_id>', methods=['DELETE'])
+@login_required
+def revoke_api_token(token_id):
+    row = ApiToken.query.filter_by(id=token_id, user_id=current_user.id).first()
+    if not row:
+        return jsonify({'error': 'Token not found'}), 404
+    db.session.delete(row)
+    db.session.commit()
+    return jsonify({'ok': True})
 
 
 @app.route('/api/data')
@@ -4490,6 +4678,7 @@ def admin_delete_user(uid):
         Assignment.query.filter_by(user_id=uid).delete()
         Assignment.query.filter_by(created_by=uid).update({'created_by': None})
         HiddenFolder.query.filter_by(hidden_by=uid).update({'hidden_by': None})
+        ApiToken.query.filter_by(user_id=uid).delete()
         db.session.delete(user)
         db.session.commit()
         logger.info(f"Admin '{current_user.username}' deleted user '{deleted_name}'")

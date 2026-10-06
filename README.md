@@ -174,6 +174,19 @@ or use the in-app `/api/db_backup` / CSV export endpoints (admin only).
 4. **Team workflow** — as admin, use *Assignments* to give each person an index range, or *Auto-split* to divide a folder with N% overlap so you can measure inter-classifier agreement on the dashboard.
 5. **Results** — export per-folder CSVs from the app (the `tags` column lists any shared tags on each image), or query the `classification` table directly (`user_id`, `image_key`, `category`, `notes`, `timestamp`). Tag memberships live in `tags` / `image_tags`.
 6. **Ad hoc groups** — use the *Tags* box in the sidebar: type a name and press Enter to create a tag and apply it to the current image, click chips to toggle, and pick a tag under *Filter Status → By Tag* to browse the group. *Manage* reveals bulk tag/untag of everything currently shown, per-tag CSV export, and delete (creator or admin).
+7. **Fetching results from scripts** — create a personal API token on the *Dashboard* (shown once; revocable there). Tokens are read-only: they work only on the export endpoints. Use the *API URL* buttons next to the export buttons to copy the URL for the current folder, then:
+
+   ```python
+   import io, os, requests
+   from astropy.table import Table
+   r = requests.get("https://<your-domain>/api/export",
+                    params={"folder": "my_folder", "format": "fits", "all_users": "true"},
+                    headers={"Authorization": "Bearer " + os.environ["CLASSIFIER_TOKEN"]})
+   r.raise_for_status()
+   t = Table.read(io.BytesIO(r.content), format="fits")
+   ```
+
+   Parameters: `folder` (required), `format=csv|fits`, `all_users=true|false` (default: your own classifications only), `category=a,b` (keep only those categories). The token may also be passed as `?token=...` (convenient for `pd.read_csv(url)`, but it then appears in proxy access logs). Per-tag CSVs are at `/api/tags/<id>/export?folder=...`.
 
 ## Repository layout
 
