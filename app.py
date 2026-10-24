@@ -20,6 +20,7 @@ from flask import Flask, render_template_string, request, jsonify, redirect, url
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from typing import List, Dict, Optional, Tuple
@@ -38,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 app = Flask(__name__)
+# Traefik terminates TLS and forwards plain HTTP; trust its one hop of X-Forwarded-* headers
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-key-please-change')
 _db_url = os.environ.get('DATABASE_URL', 'sqlite:///local.db')
 # SQLAlchemy >= 2.1 maps bare postgresql:// to psycopg (v3); we ship psycopg2
